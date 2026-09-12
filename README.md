@@ -38,21 +38,31 @@ claude plugin install model-advisor@model-advisor --scope user
 
 默认读取 `~/.config/model-advisor/config.json`，可用 `ADVISOR_CONFIG` 指定另一绝对路径。配置只在 MCP Server 启动时读取，改完需重启 Claude Code。文件中只写环境变量名，不写密钥。
 
-第三方模型经本地 OpenAI 兼容代理（例如 CLIProxyAPI）的示例：
+插件与模型、供应商无关：任何提供 OpenAI Chat Completions 形状接口的服务（云端 API、本地网关、自建推理服务）都能作为 `chat-completions` profile；其他协议用 `command` Adapter 包一层。`model` 填供应商实际可用的模型 ID，profile 名（如 `sol`、`luna`）只是你自己的叫法。
+
+顾问池示例，默认 `sol`，也可用 `profile=luna` 指定：
 
 ```json
 {
   "version": 1,
-  "defaultProfile": "luna",
+  "defaultProfile": "sol",
   "profiles": {
+    "sol": {
+      "kind": "chat-completions",
+      "description": "Default advisor.",
+      "enabled": true,
+      "endpoint": "https://<provider>/v1/chat/completions",
+      "apiKeyEnv": "SOL_ADVISOR_API_KEY",
+      "model": "<provider-model-id>"
+    },
     "luna": {
       "kind": "chat-completions",
-      "description": "Third-party model via local proxy.",
+      "description": "Second opinion from a different provider.",
       "enabled": true,
       "endpoint": "http://127.0.0.1:8317/v1/chat/completions",
       "allowInsecureLoopback": true,
       "apiKeyEnv": "LUNA_ADVISOR_API_KEY",
-      "model": "gpt-5.6-luna"
+      "model": "<local-gateway-model-id>"
     }
   }
 }
@@ -97,7 +107,7 @@ node scripts/consult-once.mjs examples/request.json
 | `npm test` | 39 / 39 通过 |
 | `npm run smoke` | MCP initialize / tools/list / tools/call 通过 |
 | `claude plugin validate` | 通过 |
-| Claude Code `--plugin-dir` 加载，`list_advisors` + `consult_advisor` | 通过（真实第三方模型，经本地 CLIProxyAPI） |
+| Claude Code `--plugin-dir` 加载，`list_advisors` + `consult_advisor` | 通过（真实第三方模型，经本地 OpenAI 兼容网关） |
 | `/model-advisor:advisor profile=luna ...` Skill 入口 | 通过 |
 
 ## 安全说明
