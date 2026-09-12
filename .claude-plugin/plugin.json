@@ -1,0 +1,9 @@
+{
+  "name": "model-advisor",
+  "version": "0.2.0",
+  "description": "Provider-independent technical advisor through MCP; explicit context and configurable model profiles.",
+  "author": { "name": "szxypi", "url": "https://github.com/szxypi" },
+  "repository": "https://github.com/szxypi/claude-model-advisor",
+  "license": "MIT",
+  "keywords": ["mcp", "advisor", "second-opinion", "skill"]
+}

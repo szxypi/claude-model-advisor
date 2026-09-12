@@ -1,0 +1,30 @@
+{
+  "version": 1,
+  "defaultProfile": "sol",
+  "limits": {
+    "timeoutMs": 120000,
+    "maxRequestBytes": 65536,
+    "maxResponseBytes": 262144,
+    "maxAnswerBytes": 24576,
+    "maxConcurrency": 1,
+    "maxCallsPerProcess": 30
+  },
+  "profiles": {
+    "sol": {
+      "kind": "chat-completions",
+      "description": "User-selected advisor profile; replace the endpoint and model ID.",
+      "enabled": false,
+      "endpoint": "https://provider.example/v1/chat/completions",
+      "apiKeyEnv": "SOL_ADVISOR_API_KEY",
+      "model": "REPLACE_WITH_PROVIDER_MODEL_ID"
+    },
+    "luna": {
+      "kind": "chat-completions",
+      "description": "An independent profile; it can use a different provider.",
+      "enabled": false,
+      "endpoint": "https://other-provider.example/v1/chat/completions",
+      "apiKeyEnv": "LUNA_ADVISOR_API_KEY",
+      "model": "REPLACE_WITH_ANOTHER_MODEL_ID"
+    }
+  }
+}

@@ -1,0 +1,5 @@
+node_modules/
+advisor.mock.json
+.env
+.env.*
+*.log

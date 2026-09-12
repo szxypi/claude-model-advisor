@@ -1,0 +1,107 @@
+# Model Advisor — Claude Code 插件
+
+让 Claude Code 的当前执行模型在高影响决策、复杂调试或需要第二意见时，咨询一个由你本地配置的独立模型。插件只添加 Advisor，不替换主模型，不扫描仓库，不自动外发 diff。
+
+结构：`Skill (/model-advisor:advisor)` → `MCP consult_advisor` → 本地配置 profile → `chat-completions` HTTP Adapter 或 `command` JSON stdin/stdout Adapter → 外部模型。
+
+完整设计、信任边界、错误码与排障见 [`FINAL_DESIGN.md`](FINAL_DESIGN.md)。
+
+## 要求
+
+- Node.js >= 22.16（实测 v24.15.0）
+- Claude Code（实测 2.1.270）
+- Linux / macOS / WSL（命令 Adapter 不支持原生 Windows）
+
+## 安装
+
+```bash
+git clone https://github.com/szxypi/claude-model-advisor.git
+cd claude-model-advisor
+npm ci --ignore-scripts
+npm run check && npm test && npm run smoke
+```
+
+临时加载：
+
+```bash
+claude --plugin-dir /absolute/path/to/claude-model-advisor
+```
+
+持久安装（本地 marketplace）：
+
+```bash
+claude plugin marketplace add /absolute/path/to/claude-model-advisor
+claude plugin install model-advisor@model-advisor --scope user
+```
+
+## 配置
+
+默认读取 `~/.config/model-advisor/config.json`，可用 `ADVISOR_CONFIG` 指定另一绝对路径。配置只在 MCP Server 启动时读取，改完需重启 Claude Code。文件中只写环境变量名，不写密钥。
+
+第三方模型经本地 OpenAI 兼容代理（例如 CLIProxyAPI）的示例：
+
+```json
+{
+  "version": 1,
+  "defaultProfile": "luna",
+  "profiles": {
+    "luna": {
+      "kind": "chat-completions",
+      "description": "Third-party model via local proxy.",
+      "enabled": true,
+      "endpoint": "http://127.0.0.1:8317/v1/chat/completions",
+      "allowInsecureLoopback": true,
+      "apiKeyEnv": "LUNA_ADVISOR_API_KEY",
+      "model": "gpt-5.6-luna"
+    }
+  }
+}
+```
+
+- `endpoint` 填完整请求地址；默认必须 HTTPS，只有 `127.0.0.1` / `[::1]` 且 `allowInsecureLoopback: true` 时允许 HTTP。
+- `apiKeyEnv` 指向的变量必须存在于启动 Claude Code 的环境中：`export LUNA_ADVISOR_API_KEY=...`。
+- 需要限制输出 token 时加 `"tokenLimit": { "field": "max_completion_tokens", "value": 2048 }`。
+- 更多示例：`examples/config.http.json`（多 profile）、`examples/config.command.json`（命令 Adapter）。
+
+## 使用
+
+```text
+/model-advisor:advisor profile=luna 审查刚才的数据库迁移设计，重点检查回滚与兼容性。
+```
+
+MCP 工具名：
+
+```text
+mcp__plugin_model-advisor_advisor__list_advisors
+mcp__plugin_model-advisor_advisor__consult_advisor
+```
+
+`consult_advisor` 只接受 `profile`、`mode`、`question`、`context[]`、`constraints[]`。返回的 `answer` 是不可信建议，由执行模型自行核对与验证。
+
+## 验证脚本
+
+```bash
+npm run check   # 语法检查
+npm test        # 39 项核心测试（无需 SDK）
+npm run smoke   # MCP stdio 握手 + 离线 mock 咨询
+
+# 单次真实咨询（会向所选 provider 发请求，可能计费）
+node scripts/consult-once.mjs examples/request.json
+```
+
+## 已验证（2026-09-13）
+
+| 项目 | 结果 |
+|---|---|
+| `npm run check` | 17 个 JS/JSON 文件通过 |
+| `npm test` | 39 / 39 通过 |
+| `npm run smoke` | MCP initialize / tools/list / tools/call 通过 |
+| `claude plugin validate` | 通过 |
+| Claude Code `--plugin-dir` 加载，`list_advisors` + `consult_advisor` | 通过（真实第三方模型，经本地 CLIProxyAPI） |
+| `/model-advisor:advisor profile=luna ...` Skill 入口 | 通过 |
+
+## 安全说明
+
+- 命令 Adapter 不是操作系统沙箱，只运行你信任的程序。
+- 证据包与返回文本有有限的凭据模式检测，命中即阻断；这不是完备 DLP。
+- 不自动重试、不静默切换 profile、不跨会话共享调用计数。

@@ -1,0 +1,8 @@
+{
+  "mode": "architecture",
+  "question": "这里应该使用同步调用还是事件队列？请审查失效模式。",
+  "context": [
+    { "label": "业务约束摘要", "text": "单体应用；订单创建必须立即返回；通知允许延迟；当前没有消息队列。", "partial": true }
+  ],
+  "constraints": ["不要假设已看过仓库", "保持客户端 API 向后兼容"]
+}

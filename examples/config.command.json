@@ -1,0 +1,15 @@
+{
+  "version": 1,
+  "defaultProfile": "private-advisor",
+  "profiles": {
+    "private-advisor": {
+      "kind": "command",
+      "enabled": false,
+      "description": "Custom JSON-stdin/JSON-stdout adapter for a private API or CLI.",
+      "model": "REPLACE_WITH_PRIVATE_MODEL_ID",
+      "command": "/absolute/path/to/python3",
+      "args": ["/absolute/path/to/private_advisor_adapter.py"],
+      "envKeys": ["PRIVATE_ADVISOR_API_KEY"]
+    }
+  }
+}

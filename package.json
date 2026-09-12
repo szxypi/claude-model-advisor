@@ -1,0 +1,17 @@
+{
+  "name": "claude-code-model-advisor",
+  "version": "0.2.0",
+  "private": true,
+  "type": "module",
+  "engines": { "node": ">=22.16.0" },
+  "scripts": {
+    "start": "node src/server.mjs",
+    "test": "node --test test/core.test.mjs",
+    "check": "node scripts/check.mjs",
+    "smoke": "node scripts/mcp-smoke.mjs"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/server": "2.0.0",
+    "zod": "4.2.0"
+  }
+}
