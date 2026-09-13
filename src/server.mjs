@@ -10,7 +10,7 @@ function result(value, isError = false) {
 async function main() {
   const engine = createAdvisor(await loadConfig());
   const handle = serveStdio(() => {
-    const server = new McpServer({ name: 'model-advisor', version: '0.5.0' });
+    const server = new McpServer({ name: 'model-advisor', version: '0.5.1' });
     server.registerTool('list_advisors', {
       description: 'List configured advisor profiles without contacting a provider. Model names are user-configured identifiers.',
       inputSchema: z.object({}).strict(),
