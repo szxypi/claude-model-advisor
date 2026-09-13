@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { validateConfig, loadConfig, normalizeInput, createAdvisor, guardSecrets, publicError } from '../src/core.mjs';
+import { validateConfig, loadConfig, normalizeInput, createAdvisor, guardSecrets, publicError, defaultHistoryPath } from '../src/core.mjs';
 const fixture = fileURLToPath(new URL('./fixtures/adapter.mjs', import.meta.url));
 const config = (mode = 'ok', limits = {}, extras = {}) => validateConfig({
   version: 1, defaultProfile: 'sol', limits,
@@ -224,6 +224,44 @@ test('fallback is not used for input, secret, budget or disabled-profile errors'
     await assert.rejects(createAdvisor(disabled).consult(input), isCode('NETWORK'));
     assert.equal(hits, 0);
   });
+});
+test('history is off by default, validated, and platform-aware', () => {
+  assert.equal(config().history.enabled, false);
+  assert.throws(() => validateConfig({ version: 1, defaultProfile: 'sol', profiles: {}, history: { enabled: 'yes' } }), isCode('CONFIG'));
+  assert.throws(() => validateConfig({ version: 1, defaultProfile: 'sol', profiles: {}, history: { path: 'relative.jsonl' } }), isCode('CONFIG'));
+  assert.match(defaultHistoryPath({ XDG_STATE_HOME: '/x' }, 'linux'), /^\/x\/model-advisor\/history\.jsonl$/);
+  assert.match(defaultHistoryPath({ LOCALAPPDATA: 'C:\\L' }, 'win32'), /model-advisor/);
+});
+test('history ledger records success, failure and fallback without leaking secrets, and never breaks a consultation', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-hist-'));
+  const path = join(dir, 'nested', 'history.jsonl');
+  try {
+    let fail500 = true;
+    await httpFixture((req, res) => {
+      if (fail500) { res.statusCode = 500; res.end('{}'); return; }
+      res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('ledger advice')));
+    }, async endpoint => {
+      const make = (extra) => validateConfig({ version: 1, defaultProfile: 'sol', history: { enabled: true, ...extra }, profiles: {
+        sol: { kind: 'chat-completions', model: 'sol-id', enabled: true, endpoint, allowInsecureLoopback: true, apiKeyEnv: 'HK', fallbackProfile: 'kimi' },
+        kimi: { kind: 'chat-completions', model: 'kimi-id', enabled: true, endpoint, allowInsecureLoopback: true },
+      } });
+      const env = { HK: 'ledger-secret-key-123' };
+      // primary 500 -> fallback also 500 -> failure record with fallback fields
+      await assert.rejects(createAdvisor(make({ path }), { env }).consult(input), isCode('HTTP_ERROR'));
+      fail500 = false;
+      const r = await createAdvisor(make({ path, storeAnswer: false }), { env }).consult({ question: 'Q2', context: [{ label: 'L1', text: 'evidence' }] });
+      assert.equal(r.answer, 'ledger advice');
+      const lines = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+      assert.equal(lines.length, 2);
+      assert.equal(lines[0].ok, false); assert.equal(lines[0].fallback_from, 'sol'); assert.equal(lines[0].profile, 'kimi'); assert.equal(lines[0].error_code, 'HTTP_ERROR');
+      assert.equal(lines[1].ok, true); assert.equal(lines[1].question, 'Q2'); assert.deepEqual(lines[1].context_labels, ['L1']);
+      assert.equal(lines[1].answer, undefined); assert.equal(lines[1].answer_bytes, 13);
+      assert.ok(!(await readFile(path, 'utf8')).includes('ledger-secret-key-123'));
+      // unwritable history path (parent is a regular file) does not break the consultation
+      await writeFile(join(dir, 'blocker'), 'x');
+      assert.equal((await createAdvisor(make({ path: join(dir, 'blocker', 'history.jsonl') }), { env }).consult(input)).answer, 'ledger advice');
+    });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTTP_RATE'], [500, 'HTTP_ERROR']]) {
   test(`HTTP ${status} returns sanitized ${code} without retries`, async () => {

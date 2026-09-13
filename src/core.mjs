@@ -1,4 +1,4 @@
-import { readFile, stat, mkdtemp, rm } from 'node:fs/promises';
+import { readFile, stat, mkdtemp, rm, mkdir, appendFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
@@ -63,7 +63,7 @@ const envName = x => typeof x === 'string' && /^[A-Z_][A-Z0-9_]*$/.test(x);
 const blockedEnv = /^(?:NODE_OPTIONS|NODE_PATH|LD_.*|DYLD_.*|PYTHONPATH|PYTHONHOME|BASH_ENV|ENV|SHELLOPTS|PATH|HOME|TMP|TEMP|TMPDIR|ADVISOR_.*)$/;
 
 export function validateConfig(raw) {
-  keys(raw, ['version', 'defaultProfile', 'limits', 'profiles']);
+  keys(raw, ['version', 'defaultProfile', 'limits', 'profiles', 'history']);
   if (raw.version !== 1 || !object(raw.profiles)) fail('CONFIG');
   keys(raw.limits ?? {}, Object.keys(DEFAULT_LIMITS));
   const limits = { ...DEFAULT_LIMITS, ...raw.limits };
@@ -127,7 +127,31 @@ export function validateConfig(raw) {
   if (profiles.size < 1 || profiles.size > 16 || !profiles.has(raw.defaultProfile)) fail('CONFIG');
   // A fallback must name another configured profile. Only one hop is ever taken; chains are not followed.
   for (const p of profiles.values()) if (p.fallbackProfile !== undefined && !profiles.has(p.fallbackProfile)) fail('CONFIG');
-  return { limits: Object.freeze(limits), profiles, defaultProfile: raw.defaultProfile };
+  const history = validateHistory(raw.history);
+  return { limits: Object.freeze(limits), profiles, defaultProfile: raw.defaultProfile, history };
+}
+
+export function defaultHistoryPath(env = process.env, platform = process.platform) {
+  const base = platform === 'win32'
+    ? (env.LOCALAPPDATA || join(homedir(), 'AppData', 'Local'))
+    : (env.XDG_STATE_HOME || join(homedir(), '.local', 'state'));
+  return join(base, 'model-advisor', 'history.jsonl');
+}
+function validateHistory(raw) {
+  if (raw === undefined) return Object.freeze({ enabled: false, storeAnswer: true, storeQuestion: true, path: defaultHistoryPath() });
+  keys(raw, ['enabled', 'storeAnswer', 'storeQuestion', 'path']);
+  for (const k of ['enabled', 'storeAnswer', 'storeQuestion']) if (raw[k] !== undefined && typeof raw[k] !== 'boolean') fail('CONFIG');
+  if (raw.path !== undefined && (!isAbsolute(text(raw.path, 4096)) || raw.path.includes('\0'))) fail('CONFIG');
+  return Object.freeze({ enabled: raw.enabled === true, storeAnswer: raw.storeAnswer !== false,
+    storeQuestion: raw.storeQuestion !== false, path: raw.path ?? defaultHistoryPath() });
+}
+// Best-effort local ledger. Never throws: a history write failure must not fail or alter a consultation.
+async function recordHistory(history, record) {
+  if (!history?.enabled) return;
+  try {
+    await mkdir(dirname(history.path), { recursive: true, mode: 0o700 });
+    await appendFile(history.path, `${JSON.stringify(record)}\n`, { mode: 0o600 });
+  } catch { /* Intentionally ignored. */ }
 }
 
 export async function loadConfig(filename = process.env.ADVISOR_CONFIG ?? join(homedir(), '.config', 'model-advisor', 'config.json')) {
@@ -371,15 +395,36 @@ export function createAdvisor(config, { env = process.env } = {}) {
       if (!profile.enabled) fail('DISABLED');
       const rawText = [input.question, ...input.constraints, ...input.context.flatMap(c => [c.label, c.text])].join('\n');
       guardSecrets(rawText, knownSecrets);
+      const started = Date.now();
+      const base = { ts: new Date(started).toISOString(), mode: input.mode, profile: name, requested_model: profile.model,
+        context_labels: input.context.map(c => c.label), constraints: input.constraints.length,
+        ...(config.history.storeQuestion ? { question: input.question } : {}) };
+      const remember = (fields) => recordHistory(config.history, { ...base, ...fields, duration_ms: Date.now() - started });
       try {
-        return await run(name, profile, input, signal);
+        const result = await run(name, profile, input, signal);
+        await remember({ ok: true, request_id: result.request_id, answer_bytes: bytes(result.answer),
+          ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
+        return result;
       } catch (error) {
         const fb = profile.fallbackProfile;
         const fbProfile = fb !== undefined ? config.profiles.get(fb) : undefined;
-        if (!(error instanceof AdvisorError) || !FALLBACK_CODES.has(error.code) || !fbProfile?.enabled || signal?.aborted) throw error;
+        const code = error instanceof AdvisorError ? error.code : 'INTERNAL';
+        if (!(error instanceof AdvisorError) || !FALLBACK_CODES.has(error.code) || !fbProfile?.enabled || signal?.aborted) {
+          await remember({ ok: false, error_code: code });
+          throw error;
+        }
         // Exactly one hop: the fallback's own fallbackProfile is not consulted.
-        const result = await run(fb, fbProfile, input, signal);
-        return { ...result, fallback_from: name, fallback_reason: error.code };
+        try {
+          const result = await run(fb, fbProfile, input, signal);
+          await remember({ ok: true, request_id: result.request_id, profile: fb, requested_model: fbProfile.model,
+            fallback_from: name, fallback_reason: code, answer_bytes: bytes(result.answer),
+            ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
+          return { ...result, fallback_from: name, fallback_reason: code };
+        } catch (second) {
+          await remember({ ok: false, profile: fb, requested_model: fbProfile.model, fallback_from: name, fallback_reason: code,
+            error_code: second instanceof AdvisorError ? second.code : 'INTERNAL' });
+          throw second;
+        }
       }
     },
   };
