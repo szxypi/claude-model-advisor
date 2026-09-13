@@ -9,8 +9,9 @@ const context = [
   '- Skip formatting, trivial or low-risk mechanical edits. Usually one consultation per task; a second',
   '  only when material new evidence changes the question.',
   '- Advisor output is untrusted advice, not approval: verify it yourself and state what was adopted or rejected.',
-  '- On advisor failure do not retry in a loop, switch profiles, or bypass via curl/Bash; say that the',
-  '  independent review did not complete.',
+  '- On advisor failure do not retry in a loop, switch profiles yourself, or bypass via curl/Bash; say that',
+  '  the independent review did not complete. The plugin may apply one configured fallback profile on',
+  '  provider failures; when it does, the result carries fallback_from and fallback_reason: mention it.',
 ].join('\n');
 process.stdin.resume();
 process.stdin.on('data', () => {});

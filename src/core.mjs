@@ -38,6 +38,10 @@ const MESSAGES = {
   NETWORK: 'Provider network request failed. Check the endpoint, TLS, and connectivity.',
   INTERNAL: 'Unexpected advisor error; sensitive diagnostic details were withheld.',
 };
+// Provider-side or transport failures where a configured fallback profile may be tried once.
+// Input, secret, budget, cancellation and configuration errors never trigger a fallback.
+const FALLBACK_CODES = new Set(['HTTP_RATE', 'HTTP_ERROR', 'HTTP_AUTH', 'NETWORK', 'TIMEOUT', 'BAD_RESPONSE',
+  'INCOMPLETE', 'OUTPUT_LIMIT', 'ADAPTER_START', 'ADAPTER_IO', 'ADAPTER_EXIT', 'SENSITIVE_OUTPUT']);
 export class AdvisorError extends Error {
   constructor(code) { super(MESSAGES[code] ?? MESSAGES.INTERNAL); this.code = code; }
 }
@@ -73,7 +77,7 @@ export function validateConfig(raw) {
   const profiles = new Map();
   for (const [name, p] of Object.entries(raw.profiles)) {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) fail('CONFIG');
-    const shared = ['kind', 'model', 'description', 'enabled'];
+    const shared = ['kind', 'model', 'description', 'enabled', 'fallbackProfile'];
     if (p?.kind === 'command') {
       keys(p, [...shared, 'command', 'args', 'envKeys']);
       text(p.command, 4096);
@@ -117,9 +121,12 @@ export function validateConfig(raw) {
     text(p.model, 256);
     if (p.description !== undefined) text(p.description, 500);
     if (p.enabled !== undefined && typeof p.enabled !== 'boolean') fail('CONFIG');
+    if (p.fallbackProfile !== undefined && (text(p.fallbackProfile, 32) === name)) fail('CONFIG');
     profiles.set(name, Object.freeze({ ...p, enabled: p.enabled === true }));
   }
   if (profiles.size < 1 || profiles.size > 16 || !profiles.has(raw.defaultProfile)) fail('CONFIG');
+  // A fallback must name another configured profile. Only one hop is ever taken; chains are not followed.
+  for (const p of profiles.values()) if (p.fallbackProfile !== undefined && !profiles.has(p.fallbackProfile)) fail('CONFIG');
   return { limits: Object.freeze(limits), profiles, defaultProfile: raw.defaultProfile };
 }
 
@@ -347,7 +354,7 @@ export function createAdvisor(config, { env = process.env } = {}) {
         calls_remaining: Math.max(0, config.limits.maxCallsPerProcess - calls),
         profiles: [...config.profiles].map(([name, p]) => ({
           name, kind: p.kind, model: p.model, enabled: p.enabled,
-          description: p.description ?? '',
+          description: p.description ?? '', fallback_profile: p.fallbackProfile ?? null,
         })) };
     },
     close() {
@@ -362,37 +369,49 @@ export function createAdvisor(config, { env = process.env } = {}) {
       const profile = config.profiles.get(name);
       if (!profile) fail('PROFILE');
       if (!profile.enabled) fail('DISABLED');
-      const request = { schema_version: 1, request_id: randomUUID(), model: profile.model,
-        mode: input.mode, question: input.question, context: input.context, constraints: input.constraints };
-      const serialized = JSON.stringify(request);
-      if (bytes(serialized) > config.limits.maxRequestBytes) fail('INPUT_TOO_LARGE');
       const rawText = [input.question, ...input.constraints, ...input.context.flatMap(c => [c.label, c.text])].join('\n');
       guardSecrets(rawText, knownSecrets);
-      if (active.size >= config.limits.maxConcurrency) fail('BUSY');
-      if (calls >= config.limits.maxCallsPerProcess) fail('BUDGET');
-      const controller = new AbortController();
-      const onAbort = () => controller.abort(new AdvisorError('CANCELLED'));
-      signal?.addEventListener('abort', onAbort, { once: true });
-      if (signal?.aborted) onAbort();
-      active.add(controller); calls += 1;
-      const started = Date.now();
-      const timer = setTimeout(() => controller.abort(new AdvisorError('TIMEOUT')), config.limits.timeoutMs);
       try {
-        const answer = profile.kind === 'command'
-          ? await commandAdapter(profile, request, config.limits, controller.signal, env)
-          : await httpAdapter(profile, request, config.limits, controller.signal, env);
-        checkAbort(controller.signal);
-        return { ok: true, schema_version: 1, request_id: request.request_id,
-          profile: name, requested_model: profile.model, untrusted: true,
-          evidence_scope: 'provided-context-only', duration_ms: Date.now() - started,
-          answer: checkedAnswer(answer, config.limits, knownSecrets) };
+        return await run(name, profile, input, signal);
       } catch (error) {
-        if (controller.signal.aborted) throw abortError(controller.signal);
-        throw error;
-      } finally {
-        clearTimeout(timer); active.delete(controller);
-        signal?.removeEventListener('abort', onAbort);
+        const fb = profile.fallbackProfile;
+        const fbProfile = fb !== undefined ? config.profiles.get(fb) : undefined;
+        if (!(error instanceof AdvisorError) || !FALLBACK_CODES.has(error.code) || !fbProfile?.enabled || signal?.aborted) throw error;
+        // Exactly one hop: the fallback's own fallbackProfile is not consulted.
+        const result = await run(fb, fbProfile, input, signal);
+        return { ...result, fallback_from: name, fallback_reason: error.code };
       }
     },
   };
+  async function run(name, profile, input, signal) {
+    if (closed) fail('SHUTDOWN');
+    const request = { schema_version: 1, request_id: randomUUID(), model: profile.model,
+      mode: input.mode, question: input.question, context: input.context, constraints: input.constraints };
+    if (bytes(JSON.stringify(request)) > config.limits.maxRequestBytes) fail('INPUT_TOO_LARGE');
+    if (active.size >= config.limits.maxConcurrency) fail('BUSY');
+    if (calls >= config.limits.maxCallsPerProcess) fail('BUDGET');
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(new AdvisorError('CANCELLED'));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    active.add(controller); calls += 1;
+    const started = Date.now();
+    const timer = setTimeout(() => controller.abort(new AdvisorError('TIMEOUT')), config.limits.timeoutMs);
+    try {
+      const answer = profile.kind === 'command'
+        ? await commandAdapter(profile, request, config.limits, controller.signal, env)
+        : await httpAdapter(profile, request, config.limits, controller.signal, env);
+      checkAbort(controller.signal);
+      return { ok: true, schema_version: 1, request_id: request.request_id,
+        profile: name, requested_model: profile.model, untrusted: true,
+        evidence_scope: 'provided-context-only', duration_ms: Date.now() - started,
+        answer: checkedAnswer(answer, config.limits, knownSecrets) };
+    } catch (error) {
+      if (controller.signal.aborted) throw abortError(controller.signal);
+      throw error;
+    } finally {
+      clearTimeout(timer); active.delete(controller);
+      signal?.removeEventListener('abort', onAbort);
+    }
+  }
 }

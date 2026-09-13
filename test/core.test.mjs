@@ -182,6 +182,49 @@ test('HTTP extraBody passes provider fields through but cannot override protocol
     assert.equal((await e.consult(input)).answer, 'HTTP fixture advice');
   });
 });
+const fallbackConfig = (primary, secondary, extra = {}) => validateConfig({
+  version: 1, defaultProfile: 'sol',
+  profiles: {
+    sol: { kind: 'chat-completions', model: 'sol-id', enabled: true, endpoint: primary, allowInsecureLoopback: true, fallbackProfile: 'kimi', ...extra },
+    kimi: { kind: 'chat-completions', model: 'kimi-id', enabled: true, endpoint: secondary, allowInsecureLoopback: true, fallbackProfile: 'sol' },
+  },
+});
+test('fallbackProfile must reference another existing profile', () => {
+  const base = { kind: 'chat-completions', model: 'm', enabled: true, endpoint: 'https://p.example/v1/chat/completions' };
+  assert.throws(() => validateConfig({ version: 1, defaultProfile: 'a', profiles: { a: { ...base, fallbackProfile: 'zzz' } } }), isCode('CONFIG'));
+  assert.throws(() => validateConfig({ version: 1, defaultProfile: 'a', profiles: { a: { ...base, fallbackProfile: 'a' } } }), isCode('CONFIG'));
+  const ok = validateConfig({ version: 1, defaultProfile: 'a', profiles: { a: { ...base, fallbackProfile: 'b' }, b: base } });
+  assert.equal(createAdvisor(ok).list().profiles[0].fallback_profile, 'b');
+});
+test('provider failure falls back exactly one hop and is reported', async () => {
+  let secondaryHits = 0;
+  await httpFixture((req, res) => { res.statusCode = 500; res.end('{}'); }, async primary => {
+    await httpFixture((req, res) => { secondaryHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); }, async secondary => {
+      const r = await createAdvisor(fallbackConfig(primary, secondary)).consult(input);
+      assert.equal(r.answer, 'kimi advice'); assert.equal(r.profile, 'kimi'); assert.equal(r.requested_model, 'kimi-id');
+      assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_ERROR'); assert.equal(secondaryHits, 1);
+      // Both profiles failing: the secondary's own fallback (sol) is not chained.
+      const dead = createAdvisor(fallbackConfig(primary, primary));
+      await assert.rejects(dead.consult(input), isCode('HTTP_ERROR'));
+      assert.equal(dead.list().calls_remaining, 28);
+    });
+  });
+});
+test('fallback is not used for input, secret, budget or disabled-profile errors', async () => {
+  let hits = 0;
+  await httpFixture((req, res) => { hits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion())); }, async secondary => {
+    const e = createAdvisor(fallbackConfig('https://primary.invalid/v1/chat/completions', secondary));
+    await assert.rejects(e.consult({ question: 'token sk-abcdefghijklmnopqrstuvwxyz0123' }), isCode('SENSITIVE_INPUT'));
+    await assert.rejects(e.consult({ question: 'x', bogus: 1 }), isCode('INPUT'));
+    assert.equal(hits, 0);
+    const disabled = validateConfig({ version: 1, defaultProfile: 'sol', profiles: {
+      sol: { kind: 'chat-completions', model: 'a', enabled: true, endpoint: 'http://127.0.0.1:9/v1/chat/completions', allowInsecureLoopback: true, fallbackProfile: 'kimi' },
+      kimi: { kind: 'chat-completions', model: 'b', enabled: false, endpoint: secondary, allowInsecureLoopback: true },
+    } });
+    await assert.rejects(createAdvisor(disabled).consult(input), isCode('NETWORK'));
+    assert.equal(hits, 0);
+  });
+});
 for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTTP_RATE'], [500, 'HTTP_ERROR']]) {
   test(`HTTP ${status} returns sanitized ${code} without retries`, async () => {
     let hits = 0;
