@@ -1,6 +1,6 @@
 ---
 name: advisor
-description: Consult a configured independent model for architecture, public API or schema changes, security review, hard debugging after repeated failures, or high-impact design uncertainty. Also use when the user explicitly requests an advisor or second opinion. Not for trivial edits.
+description: Proactively consult a configured independent model BEFORE architecture design, public API or database schema changes, security-sensitive changes, complex concurrency or migration plans, and after two failed fixes of the same bug. Also use when the user explicitly requests an advisor or second opinion. Not for formatting, trivial or low-risk mechanical edits. Usually one consultation per task.
 argument-hint: "[profile=<configured-name>] <question>"
 ---
 
