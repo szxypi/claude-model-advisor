@@ -167,6 +167,21 @@ test('HTTP adapter sends the configured model, correct auth, explicit evidence a
     assert.equal((await e.consult(input)).answer, 'HTTP fixture advice');
   });
 });
+test('HTTP extraBody passes provider fields through but cannot override protocol fields', async () => {
+  for (const extraBody of [{ model: 'x' }, { messages: [] }, { stream: true }, { tools: [] }, { 'Bad-Key': 1 }, [], 'x', { fn() {} }])
+    assert.throws(() => httpConfig('https://provider.example/v1/chat/completions', { extraBody }), isCode('CONFIG'));
+  assert.throws(() => httpConfig('https://provider.example/v1/chat/completions', { extraBody: { max_tokens: 1 }, tokenLimit: { field: 'max_tokens', value: 2 } }), isCode('CONFIG'));
+  await httpFixture(async (req, res) => {
+    let body = ''; for await (const c of req) body += c;
+    const parsed = JSON.parse(body);
+    assert.equal(parsed.reasoning_effort, 'xhigh'); assert.equal(parsed.temperature, 0.2);
+    assert.equal(parsed.model, 'third-party-id'); assert.equal(parsed.stream, false);
+    res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion()));
+  }, async endpoint => {
+    const e = createAdvisor(httpConfig(endpoint, { extraBody: { reasoning_effort: 'xhigh', temperature: 0.2 } }));
+    assert.equal((await e.consult(input)).answer, 'HTTP fixture advice');
+  });
+});
 for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTTP_RATE'], [500, 'HTTP_ERROR']]) {
   test(`HTTP ${status} returns sanitized ${code} without retries`, async () => {
     let hits = 0;

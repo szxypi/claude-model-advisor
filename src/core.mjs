@@ -86,7 +86,7 @@ export function validateConfig(raw) {
       if (p.envKeys !== undefined && (!Array.isArray(p.envKeys) || p.envKeys.length > 16)) fail('CONFIG');
       for (const k of p.envKeys ?? []) if (!envName(k) || blockedEnv.test(k)) fail('CONFIG');
     } else if (p?.kind === 'chat-completions') {
-      keys(p, [...shared, 'endpoint', 'apiKeyEnv', 'allowInsecureLoopback', 'systemRole', 'tokenLimit']);
+      keys(p, [...shared, 'endpoint', 'apiKeyEnv', 'allowInsecureLoopback', 'systemRole', 'tokenLimit', 'extraBody']);
       let url;
       try { url = new URL(text(p.endpoint, 4096)); } catch { fail('CONFIG'); }
       const local = ['127.0.0.1', '[::1]'].includes(url.hostname);
@@ -99,6 +99,19 @@ export function validateConfig(raw) {
         keys(p.tokenLimit, ['field', 'value']);
         if (!['max_tokens', 'max_completion_tokens'].includes(p.tokenLimit.field)) fail('CONFIG');
         integer(p.tokenLimit.value, 1, 32768);
+      }
+      if (p.extraBody !== undefined) {
+        // Provider-specific request fields (e.g. reasoning_effort, temperature). Plain JSON only;
+        // the protocol-defining fields stay under plugin control.
+        if (!object(p.extraBody) || Object.keys(p.extraBody).length > 16) fail('CONFIG');
+        const reserved = ['model', 'messages', 'stream', 'tools', 'tool_choice', 'functions', 'function_call', 'response_format'];
+        for (const k of Object.keys(p.extraBody)) {
+          if (!/^[a-z][a-z0-9_]{0,63}$/.test(k) || reserved.includes(k)) fail('CONFIG');
+          if (p.tokenLimit && k === p.tokenLimit.field) fail('CONFIG');
+        }
+        let json;
+        try { json = JSON.stringify(p.extraBody); } catch { fail('CONFIG'); }
+        if (typeof json !== 'string' || bytes(json) > 4096 || Object.keys(JSON.parse(json)).length !== Object.keys(p.extraBody).length) fail('CONFIG');
       }
     } else fail('CONFIG');
     text(p.model, 256);
@@ -187,6 +200,7 @@ async function httpAdapter(profile, request, limits, signal, env) {
     messages: [{ role: profile.systemRole ?? 'system', content: SYSTEM_PROMPT },
       { role: 'user', content: JSON.stringify(request) }],
     stream: false,
+    ...(profile.extraBody ?? {}),
     ...(profile.tokenLimit ? { [profile.tokenLimit.field]: profile.tokenLimit.value } : {}),
   });
   if (bytes(body) > limits.maxRequestBytes) fail('INPUT_TOO_LARGE');
