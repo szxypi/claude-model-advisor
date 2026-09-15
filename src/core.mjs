@@ -5,9 +5,14 @@ import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, dirname, delimiter } from 'node:path';
 
 export const DEFAULT_LIMITS = Object.freeze({
-  timeoutMs: 120000, maxRequestBytes: 65536, maxResponseBytes: 262144,
+  timeoutMs: 120000, totalTimeoutMs: 840000, maxRequestBytes: 65536, maxResponseBytes: 262144,
   maxAnswerBytes: 24576, maxConcurrency: 1, maxCallsPerProcess: 30,
 });
+// Must stay below the host tool timeout in .mcp.json (900000 ms) so the plugin, not Claude Code,
+// ends a consultation: the host kill leaves no structured error and no ledger record.
+const MAX_TOTAL_TIMEOUT_MS = 840000;
+// A fallback attempt with less time than this left before the overall deadline is skipped.
+const MIN_FALLBACK_MS = 30000;
 const MODES = ['architecture', 'review', 'debug', 'security', 'planning', 'general'];
 const MESSAGES = {
   CONFIG: 'Invalid configuration. Check the documented fields and value ranges.',
@@ -67,7 +72,8 @@ export function validateConfig(raw) {
   if (raw.version !== 1 || !object(raw.profiles)) fail('CONFIG');
   keys(raw.limits ?? {}, Object.keys(DEFAULT_LIMITS));
   const limits = { ...DEFAULT_LIMITS, ...raw.limits };
-  integer(limits.timeoutMs, 1000, 180000);
+  integer(limits.timeoutMs, 1000, 600000);
+  integer(limits.totalTimeoutMs, limits.timeoutMs, MAX_TOTAL_TIMEOUT_MS);
   integer(limits.maxRequestBytes, 1024, 262144);
   integer(limits.maxResponseBytes, 1024, 1048576);
   integer(limits.maxAnswerBytes, 256, 65536);
@@ -396,12 +402,13 @@ export function createAdvisor(config, { env = process.env } = {}) {
       const rawText = [input.question, ...input.constraints, ...input.context.flatMap(c => [c.label, c.text])].join('\n');
       guardSecrets(rawText, knownSecrets);
       const started = Date.now();
+      const deadline = started + config.limits.totalTimeoutMs;
       const base = { ts: new Date(started).toISOString(), mode: input.mode, profile: name, requested_model: profile.model,
         context_labels: input.context.map(c => c.label), constraints: input.constraints.length,
         ...(config.history.storeQuestion ? { question: input.question } : {}) };
       const remember = (fields) => recordHistory(config.history, { ...base, ...fields, duration_ms: Date.now() - started });
       try {
-        const result = await run(name, profile, input, signal);
+        const result = await run(name, profile, input, signal, config.limits.timeoutMs);
         await remember({ ok: true, request_id: result.request_id, answer_bytes: bytes(result.answer),
           ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
         return result;
@@ -413,9 +420,16 @@ export function createAdvisor(config, { env = process.env } = {}) {
           await remember({ ok: false, error_code: code });
           throw error;
         }
+        // The fallback only gets what is left of the overall deadline; too little left means skip it
+        // rather than start a paid request that cannot finish.
+        const budget = Math.min(config.limits.timeoutMs, deadline - Date.now());
+        if (budget < Math.min(MIN_FALLBACK_MS, config.limits.timeoutMs)) {
+          await remember({ ok: false, error_code: code, fallback_skipped: 'DEADLINE' });
+          throw error;
+        }
         // Exactly one hop: the fallback's own fallbackProfile is not consulted.
         try {
-          const result = await run(fb, fbProfile, input, signal);
+          const result = await run(fb, fbProfile, input, signal, budget);
           await remember({ ok: true, request_id: result.request_id, profile: fb, requested_model: fbProfile.model,
             fallback_from: name, fallback_reason: code, answer_bytes: bytes(result.answer),
             ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
@@ -428,7 +442,7 @@ export function createAdvisor(config, { env = process.env } = {}) {
       }
     },
   };
-  async function run(name, profile, input, signal) {
+  async function run(name, profile, input, signal, timeoutMs) {
     if (closed) fail('SHUTDOWN');
     const request = { schema_version: 1, request_id: randomUUID(), model: profile.model,
       mode: input.mode, question: input.question, context: input.context, constraints: input.constraints };
@@ -441,7 +455,7 @@ export function createAdvisor(config, { env = process.env } = {}) {
     if (signal?.aborted) onAbort();
     active.add(controller); calls += 1;
     const started = Date.now();
-    const timer = setTimeout(() => controller.abort(new AdvisorError('TIMEOUT')), config.limits.timeoutMs);
+    const timer = setTimeout(() => controller.abort(new AdvisorError('TIMEOUT')), timeoutMs);
     try {
       const answer = profile.kind === 'command'
         ? await commandAdapter(profile, request, config.limits, controller.signal, env)

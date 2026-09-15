@@ -3,7 +3,7 @@
     "advisor": {
       "command": "node",
       "args": ["${CLAUDE_PLUGIN_ROOT}/src/server.mjs"],
-      "timeout": 200000
+      "timeout": 900000
     }
   }
 }

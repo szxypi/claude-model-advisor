@@ -12,6 +12,8 @@ const context = [
   '- On advisor failure do not retry in a loop, switch profiles yourself, or bypass via curl/Bash; say that',
   '  the independent review did not complete. The plugin may apply one configured fallback profile on',
   '  provider failures; when it does, the result carries fallback_from and fallback_reason: mention it.',
+  '- A consultation can take several minutes. If Claude Code moves it to the background, keep working and',
+  '  wait for its completion notification; do not issue the same consultation again.',
 ].join('\n');
 process.stdin.resume();
 process.stdin.on('data', () => {});

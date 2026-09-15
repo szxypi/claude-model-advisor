@@ -21,7 +21,11 @@ test('configuration rejects unknown fields and invalid profile references', () =
   assert.throws(() => validateConfig({ version: 1, defaultProfile: 'x', profiles: {} }), isCode('CONFIG'));
 });
 test('configuration rejects invalid numeric limits and unsafe environment keys', () => {
-  for (const timeoutMs of [NaN, -1, 0, 999, 180001, 1.5]) assert.throws(() => config('ok', { timeoutMs }), isCode('CONFIG'));
+  for (const timeoutMs of [NaN, -1, 0, 999, 600001, 1.5]) assert.throws(() => config('ok', { timeoutMs }), isCode('CONFIG'));
+  // The overall deadline covers at least one attempt and stays below the host tool timeout.
+  for (const totalTimeoutMs of [NaN, 1.5, 119999, 840001]) assert.throws(() => config('ok', { totalTimeoutMs }), isCode('CONFIG'));
+  assert.throws(() => config('ok', { timeoutMs: 600000, totalTimeoutMs: 300000 }), isCode('CONFIG'));
+  assert.equal(config('ok', { timeoutMs: 300000 }).limits.totalTimeoutMs, 840000);
   for (const key of ['NODE_OPTIONS', 'PATH', 'LD_PRELOAD', 'ADVISOR_CONFIG']) assert.throws(() => config('ok', {}, { envKeys: [key] }), isCode('CONFIG'));
 });
 test('command must be absolute or the explicit node alias', () => {
@@ -182,8 +186,8 @@ test('HTTP extraBody passes provider fields through but cannot override protocol
     assert.equal((await e.consult(input)).answer, 'HTTP fixture advice');
   });
 });
-const fallbackConfig = (primary, secondary, extra = {}) => validateConfig({
-  version: 1, defaultProfile: 'sol',
+const fallbackConfig = (primary, secondary, extra = {}, top = {}) => validateConfig({
+  version: 1, defaultProfile: 'sol', ...top,
   profiles: {
     sol: { kind: 'chat-completions', model: 'sol-id', enabled: true, endpoint: primary, allowInsecureLoopback: true, fallbackProfile: 'kimi', ...extra },
     kimi: { kind: 'chat-completions', model: 'kimi-id', enabled: true, endpoint: secondary, allowInsecureLoopback: true, fallbackProfile: 'sol' },
@@ -209,6 +213,34 @@ test('provider failure falls back exactly one hop and is reported', async () => 
       assert.equal(dead.list().calls_remaining, 28);
     });
   });
+});
+test('primary timeout falls back within the overall deadline', async () => {
+  let secondaryHits = 0;
+  await httpFixture(() => {}, async primary => {
+    await httpFixture((req, res) => { secondaryHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); }, async secondary => {
+      const start = Date.now();
+      const r = await createAdvisor(fallbackConfig(primary, secondary, {}, { limits: { timeoutMs: 1000, totalTimeoutMs: 5000 } })).consult(input);
+      assert.equal(r.answer, 'kimi advice'); assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'TIMEOUT');
+      assert.equal(secondaryHits, 1); assert.ok(Date.now() - start < 2500);
+    });
+  });
+});
+test('fallback is skipped when the overall deadline leaves too little time, and the skip is recorded', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-deadline-'));
+  const path = join(dir, 'history.jsonl');
+  let secondaryHits = 0;
+  try {
+    await httpFixture(() => {}, async primary => {
+      await httpFixture((req, res) => { secondaryHits++; res.end(JSON.stringify(completion())); }, async secondary => {
+        const start = Date.now();
+        const e = createAdvisor(fallbackConfig(primary, secondary, {}, { limits: { timeoutMs: 1000, totalTimeoutMs: 1500 }, history: { enabled: true, path } }));
+        await assert.rejects(e.consult(input), isCode('TIMEOUT'));
+        assert.equal(secondaryHits, 0); assert.ok(Date.now() - start < 2500);
+        const [line] = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+        assert.equal(line.profile, 'sol'); assert.equal(line.error_code, 'TIMEOUT'); assert.equal(line.fallback_skipped, 'DEADLINE');
+      });
+    });
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test('fallback is not used for input, secret, budget or disabled-profile errors', async () => {
   let hits = 0;

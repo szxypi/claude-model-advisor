@@ -72,6 +72,7 @@ claude plugin install model-advisor@model-advisor --scope user
 - `apiKeyEnv` 指向的变量必须存在于启动 Claude Code 的环境中：`export LUNA_ADVISOR_API_KEY=...`。
 - 需要限制输出 token 时加 `"tokenLimit": { "field": "max_completion_tokens", "value": 2048 }`。
 - 需要自动回退时给 profile 加 `"fallbackProfile": "kimi"`：仅当该 profile 出现供应商/传输类错误（限流、5xx、网络、超时、响应无效等）时改用指定 profile 重试一次，结果里带 `fallback_from` 和 `fallback_reason`；输入错误、敏感信息拦截、取消、次数用尽不会回退，也不会沿回退 profile 继续链式回退。
+- 超时：`limits.timeoutMs` 是单个 profile 一次请求的截止时间（默认 120000，允许 1000–600000 ms），推理强度高的模型要调大；`limits.totalTimeoutMs` 是含回退在内整次咨询的截止时间（默认 840000，允许 `timeoutMs`–840000 ms），回退只用剩余时间，剩余不足 30 秒（或不足 `timeoutMs`，取小者）时跳过回退、直接返回原错误，台账记 `fallback_skipped: "DEADLINE"`。宿主工具超时 `.mcp.json` 为 900000 ms，始终比插件自身截止时间多留 60 秒；Claude Code 在调用满 120 秒后会把它转入后台继续等。
 - 需要传供应商特有参数（推理强度、temperature 等）时加 `"extraBody": { "reasoning_effort": "xhigh" }`，内容原样并入请求体；不能覆盖 `model`/`messages`/`stream`/工具类字段，字段名和取值是否被支持由供应商决定。
 - 更多示例：`examples/config.http.json`（多 profile）、`examples/config.command.json`（命令 Adapter）。
 
