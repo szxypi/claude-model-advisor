@@ -186,6 +186,33 @@ test('HTTP extraBody passes provider fields through but cannot override protocol
     assert.equal((await e.consult(input)).answer, 'HTTP fixture advice');
   });
 });
+test('answerWordBudget is range-checked and reaches both the directive line and the payload', async () => {
+  const base = { kind: 'chat-completions', model: 'm', enabled: true, endpoint: 'https://p.example/v1/chat/completions' };
+  for (const bad of [39, 2001, 400.5, '400', null]) {
+    assert.throws(() => validateConfig({ version: 1, defaultProfile: 'a', profiles: { a: { ...base, answerWordBudget: bad } } }), isCode('CONFIG'));
+  }
+  let seen;
+  await httpFixture((req, res) => {
+    let raw = '';
+    req.on('data', c => { raw += c; });
+    req.on('end', () => {
+      seen = JSON.parse(raw);
+      res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion()));
+    });
+  }, async endpoint => {
+    await createAdvisor(httpConfig(endpoint, { answerWordBudget: 400 })).consult(input);
+    const user = seen.messages.at(-1);
+    assert.equal(user.role, 'user');
+    assert.match(user.content, /^\(Advisor: please keep your guidance under 400 words/);
+    // The JSON evidence package follows the directive line and carries the budget for command adapters.
+    assert.equal(JSON.parse(user.content.slice(user.content.indexOf('\n') + 1)).answer_word_budget, 400);
+    // Unset means no directive line and no field at all.
+    await createAdvisor(httpConfig(endpoint)).consult(input);
+    const plain = seen.messages.at(-1).content;
+    assert.ok(!plain.startsWith('(Advisor:'));
+    assert.equal(JSON.parse(plain).answer_word_budget, undefined);
+  });
+});
 const fallbackConfig = (primary, secondary, extra = {}, top = {}) => validateConfig({
   version: 1, defaultProfile: 'sol', ...top,
   profiles: {
@@ -206,10 +233,10 @@ test('provider failure falls back exactly one hop and is reported', async () => 
     await httpFixture((req, res) => { secondaryHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); }, async secondary => {
       const r = await createAdvisor(fallbackConfig(primary, secondary)).consult(input);
       assert.equal(r.answer, 'kimi advice'); assert.equal(r.profile, 'kimi'); assert.equal(r.requested_model, 'kimi-id');
-      assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_ERROR'); assert.equal(secondaryHits, 1);
+      assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_OVERLOADED'); assert.equal(secondaryHits, 1);
       // Both profiles failing: the secondary's own fallback (sol) is not chained.
       const dead = createAdvisor(fallbackConfig(primary, primary));
-      await assert.rejects(dead.consult(input), isCode('HTTP_ERROR'));
+      await assert.rejects(dead.consult(input), isCode('HTTP_OVERLOADED'));
       assert.equal(dead.list().calls_remaining, 28);
     });
   });
@@ -279,13 +306,13 @@ test('history ledger records success, failure and fallback without leaking secre
       } });
       const env = { HK: 'ledger-secret-key-123' };
       // primary 500 -> fallback also 500 -> failure record with fallback fields
-      await assert.rejects(createAdvisor(make({ path }), { env }).consult(input), isCode('HTTP_ERROR'));
+      await assert.rejects(createAdvisor(make({ path }), { env }).consult(input), isCode('HTTP_OVERLOADED'));
       fail500 = false;
       const r = await createAdvisor(make({ path, storeAnswer: false }), { env }).consult({ question: 'Q2', context: [{ label: 'L1', text: 'evidence' }] });
       assert.equal(r.answer, 'ledger advice');
       const lines = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
       assert.equal(lines.length, 2);
-      assert.equal(lines[0].ok, false); assert.equal(lines[0].fallback_from, 'sol'); assert.equal(lines[0].profile, 'kimi'); assert.equal(lines[0].error_code, 'HTTP_ERROR');
+      assert.equal(lines[0].ok, false); assert.equal(lines[0].fallback_from, 'sol'); assert.equal(lines[0].profile, 'kimi'); assert.equal(lines[0].error_code, 'HTTP_OVERLOADED');
       assert.equal(lines[1].ok, true); assert.equal(lines[1].question, 'Q2'); assert.deepEqual(lines[1].context_labels, ['L1']);
       assert.equal(lines[1].answer, undefined); assert.equal(lines[1].answer_bytes, 13);
       assert.ok(!(await readFile(path, 'utf8')).includes('ledger-secret-key-123'));
@@ -295,7 +322,8 @@ test('history ledger records success, failure and fallback without leaking secre
     });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
-for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTTP_RATE'], [500, 'HTTP_ERROR']]) {
+for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTTP_RATE'],
+  [400, 'HTTP_ERROR'], [500, 'HTTP_OVERLOADED'], [503, 'HTTP_OVERLOADED']]) {
   test(`HTTP ${status} returns sanitized ${code} without retries`, async () => {
     let hits = 0;
     await httpFixture((req, res) => { hits++; res.writeHead(status); res.end('do-not-echo-this-provider-secret'); }, async endpoint => {

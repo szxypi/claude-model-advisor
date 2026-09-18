@@ -39,13 +39,14 @@ const MESSAGES = {
   INCOMPLETE: 'Provider response was incomplete or requested tools; advice was not accepted.',
   HTTP_AUTH: 'Provider rejected authentication or authorization.',
   HTTP_RATE: 'Provider rate limit reached. No automatic retry was performed.',
+  HTTP_OVERLOADED: 'Provider is overloaded or failing (5xx); response body was withheld.',
   HTTP_ERROR: 'Provider returned an unsuccessful HTTP status; response body was withheld.',
   NETWORK: 'Provider network request failed. Check the endpoint, TLS, and connectivity.',
   INTERNAL: 'Unexpected advisor error; sensitive diagnostic details were withheld.',
 };
 // Provider-side or transport failures where a configured fallback profile may be tried once.
 // Input, secret, budget, cancellation and configuration errors never trigger a fallback.
-const FALLBACK_CODES = new Set(['HTTP_RATE', 'HTTP_ERROR', 'HTTP_AUTH', 'NETWORK', 'TIMEOUT', 'BAD_RESPONSE',
+const FALLBACK_CODES = new Set(['HTTP_RATE', 'HTTP_OVERLOADED', 'HTTP_ERROR', 'HTTP_AUTH', 'NETWORK', 'TIMEOUT', 'BAD_RESPONSE',
   'INCOMPLETE', 'OUTPUT_LIMIT', 'ADAPTER_START', 'ADAPTER_IO', 'ADAPTER_EXIT', 'SENSITIVE_OUTPUT']);
 export class AdvisorError extends Error {
   constructor(code) { super(MESSAGES[code] ?? MESSAGES.INTERNAL); this.code = code; }
@@ -83,7 +84,7 @@ export function validateConfig(raw) {
   const profiles = new Map();
   for (const [name, p] of Object.entries(raw.profiles)) {
     if (!/^[a-z][a-z0-9_-]{0,31}$/.test(name)) fail('CONFIG');
-    const shared = ['kind', 'model', 'description', 'enabled', 'fallbackProfile'];
+    const shared = ['kind', 'model', 'description', 'enabled', 'fallbackProfile', 'answerWordBudget'];
     if (p?.kind === 'command') {
       keys(p, [...shared, 'command', 'args', 'envKeys']);
       text(p.command, 4096);
@@ -125,6 +126,7 @@ export function validateConfig(raw) {
       }
     } else fail('CONFIG');
     text(p.model, 256);
+    if (p.answerWordBudget !== undefined) integer(p.answerWordBudget, 40, 2000);
     if (p.description !== undefined) text(p.description, 500);
     if (p.enabled !== undefined && typeof p.enabled !== 'boolean') fail('CONFIG');
     if (p.fallbackProfile !== undefined && (text(p.fallbackProfile, 32) === name)) fail('CONFIG');
@@ -207,6 +209,17 @@ Return concise Markdown using these headings: Assessment, Recommendation, Risks,
 Validation, Missing context. Match the user's language. Give actionable checks and label
 uncertainty. Do not output credentials or reproduce secrets.`;
 
+// A direct, second-person line in the user message caps advisor output far more reliably than a
+// third-person field buried in the JSON evidence package. The cap is a soft request, so configure
+// roughly 80% of the length you actually accept. Command adapters read answer_word_budget instead.
+export function userMessage(request) {
+  const budget = request.answer_word_budget;
+  if (budget === undefined) return JSON.stringify(request);
+  return `(Advisor: please keep your guidance under ${budget} words \u2014 I need a focused starting `
+    + `point, not a comprehensive plan. Keep every heading, but make each one short.)\n`
+    + JSON.stringify(request);
+}
+
 function abortError(signal) {
   return signal?.reason instanceof AdvisorError ? signal.reason : new AdvisorError('CANCELLED');
 }
@@ -235,7 +248,7 @@ async function httpAdapter(profile, request, limits, signal, env) {
   const body = JSON.stringify({
     model: profile.model,
     messages: [{ role: profile.systemRole ?? 'system', content: SYSTEM_PROMPT },
-      { role: 'user', content: JSON.stringify(request) }],
+      { role: 'user', content: userMessage(request) }],
     stream: false,
     ...(profile.extraBody ?? {}),
     ...(profile.tokenLimit ? { [profile.tokenLimit.field]: profile.tokenLimit.value } : {}),
@@ -248,7 +261,9 @@ async function httpAdapter(profile, request, limits, signal, env) {
   } catch { if (signal.aborted) throw abortError(signal); fail('NETWORK'); }
   if (!response.ok) {
     await response.body?.cancel().catch(() => {});
-    fail([401, 403].includes(response.status) ? 'HTTP_AUTH' : response.status === 429 ? 'HTTP_RATE' : 'HTTP_ERROR');
+    fail([401, 403].includes(response.status) ? 'HTTP_AUTH'
+      : response.status === 429 ? 'HTTP_RATE'
+      : response.status >= 500 ? 'HTTP_OVERLOADED' : 'HTTP_ERROR');
   }
   if (!response.body) fail('BAD_RESPONSE');
   const reader = response.body.getReader();
@@ -445,7 +460,8 @@ export function createAdvisor(config, { env = process.env } = {}) {
   async function run(name, profile, input, signal, timeoutMs) {
     if (closed) fail('SHUTDOWN');
     const request = { schema_version: 1, request_id: randomUUID(), model: profile.model,
-      mode: input.mode, question: input.question, context: input.context, constraints: input.constraints };
+      mode: input.mode, question: input.question, context: input.context, constraints: input.constraints,
+      ...(profile.answerWordBudget !== undefined ? { answer_word_budget: profile.answerWordBudget } : {}) };
     if (bytes(JSON.stringify(request)) > config.limits.maxRequestBytes) fail('INPUT_TOO_LARGE');
     if (active.size >= config.limits.maxConcurrency) fail('BUSY');
     if (calls >= config.limits.maxCallsPerProcess) fail('BUDGET');
