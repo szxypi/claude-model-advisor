@@ -77,6 +77,28 @@ claude plugin install model-advisor@model-advisor --scope user
 - 需要传供应商特有参数（推理强度、temperature 等）时加 `"extraBody": { "reasoning_effort": "xhigh" }`，内容原样并入请求体；不能覆盖 `model`/`messages`/`stream`/工具类字段，字段名和取值是否被支持由供应商决定。
 - 更多示例：`examples/config.http.json`（多 profile）、`examples/config.command.json`（命令 Adapter）。
 
+### 自动附带会话记录（默认关闭）
+
+打开后，每次咨询会自动附带一段当前 Claude Code 会话的节选，顾问不再只看执行器手工挑的证据：
+
+```json
+"transcript": { "enabled": true, "maxBytes": 24576, "maxTurns": 40, "maxItemBytes": 2000 }
+```
+
+- 定位方式：MCP server 从 `CLAUDE_CODE_SESSION_ID` + `CLAUDE_PROJECT_DIR` 推出 `~/.claude/projects/<slug>/<session>.jsonl`；slug 规则是把路径里每个非字母数字字符换成 `-`。推不中时按 session UUID 在 projects 下做一层扫描。
+- 取哪些内容：只取主线程（`isSidechain` 的子代理轮次排除）的 user/assistant 轮次，工具调用和工具结果保留，**thinking 一律丢弃**（既省预算，也不该让顾问顺着执行器的思路走）。
+- 三层大小限制，全部在解析前生效，不随会话长度增长：
+  1. 磁盘读取只开窗口——文件尾部 `min(maxBytes × 8, 4 MiB)` 加头部 64 KiB（用来捞最初那条任务）；3 MB 的记录文件也不会整份读进来。
+  2. `maxTurns` 限轮数，`maxItemBytes` 限单轮字节（超长按 UTF-8 边界截断）。
+  3. `maxBytes` 限节选总字节：**从最新一轮往回填**，旧轮次先丢，并始终给“最初的任务”留位；结果里带 `dropped_older_turns`。
+- 工具调用参数单独按 `maxItemBytes / 4` 截断（下限 200 字节）：顾问需要的是「跑了哪个工具、结果是什么」，不是一段逐字的 4 KB heredoc 把下面的结果挤掉。
+- 窗口之外的轮次**根本没读过、也无法计数**，所以不会混进 `dropped_older_turns`：这种情况节选里会插一行 `…[earlier turns not read: …]`，payload 里带 `earlier_turns_not_read: true`。别让顾问把节选当成完整经过。
+- 再往上还会被请求体夹一次：实际预算 = `min(profile.transcriptMaxBytes, transcript.maxBytes, (limits.maxRequestBytes − 其余 payload − 512) / 1.2)`，留头是给 JSON 转义。放不下就**不附带**，而不是让整次咨询失败。
+- 顾问模型上下文小的时候，给那个 profile 单独加 `"transcriptMaxBytes": 8192` 压低；设成 `0` 表示该 profile 完全不带会话记录。`maxBytes` 上限 131072，按顾问模型真实上下文留足余量。
+- 隐私：节选里的凭据会被替换成 `[redacted]`（不像手工证据那样直接报错拦截）；替换后仍能匹配到密钥形态就整段丢弃。单次咨询传 `include_transcript: false` 可临时关闭；配置关着时任何调用都无法打开。
+- `list_advisors` 会返回 `session_transcript_enabled`，结果和台账里带 `transcript_turns`、`evidence_scope`。
+
+
 ## 使用
 
 ```text

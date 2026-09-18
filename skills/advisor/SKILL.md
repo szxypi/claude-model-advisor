@@ -40,10 +40,16 @@ failures in a loop. Do not silently switch profiles after a failure.
 
 ## What to send
 
-This advisor receives nothing automatically and cannot read the repository. Before a
-consultation, formulate one concrete question and gather only the context needed using the
-host's normal permissions. Send short labeled evidence snippets, relevant constraints, and
-indicate whether each snippet is partial. A label is only a label, not a path the advisor
+This advisor cannot read the repository. Before a consultation, formulate one concrete question
+and gather only the context needed using the host's normal permissions. Send short labeled
+evidence snippets, relevant constraints, and indicate whether each snippet is partial.
+
+When `list_advisors` reports `session_transcript_enabled`, a clipped excerpt of the current
+session is attached automatically: the opening task plus the most recent turns, thinking
+excluded, older turns dropped to fit a byte budget. It is a reminder of what happened, not
+coverage — still supply evidence that falls outside it, and do not claim the advisor saw the
+whole session. Pass `include_transcript: false` for a call whose session context should not
+leave the machine; a call can never switch the transcript on when the configuration disables it. A label is only a label, not a path the advisor
 can open. Do not send secrets, .env contents, credentials, unrelated code, or full
 transcripts. Respect user/organization data-sharing restrictions even if a profile is
 enabled. The consultation may send data to the configured provider and may incur charges;

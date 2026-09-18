@@ -26,5 +26,11 @@
       "apiKeyEnv": "LUNA_ADVISOR_API_KEY",
       "model": "REPLACE_WITH_ANOTHER_MODEL_ID"
     }
+  },
+  "transcript": {
+    "enabled": false,
+    "maxBytes": 24576,
+    "maxTurns": 40,
+    "maxItemBytes": 2000
   }
 }

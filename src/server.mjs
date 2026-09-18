@@ -10,14 +10,14 @@ function result(value, isError = false) {
 async function main() {
   const engine = createAdvisor(await loadConfig());
   const handle = serveStdio(() => {
-    const server = new McpServer({ name: 'model-advisor', version: '0.7.0' });
+    const server = new McpServer({ name: 'model-advisor', version: '0.8.0' });
     server.registerTool('list_advisors', {
       description: 'List configured advisor profiles without contacting a provider. Model names are user-configured identifiers.',
       inputSchema: z.object({}).strict(),
       annotations: { readOnlyHint: true, openWorldHint: false, idempotentHint: true },
     }, async () => result(engine.list()));
     server.registerTool('consult_advisor', {
-      description: 'Ask a stronger reviewer model for independent advice. Call it BEFORE substantive work (before writing or editing, before committing to an interpretation or assumption), when stuck, when changing approach, and once more when you believe the task is done. Orientation reads are not substantive work: orient first, then consult. Unlike a server-side advisor it sees nothing automatically and cannot read the repository, so supply the question plus short labeled evidence. Sends only supplied context; may transmit data and incur cost. Returned text is untrusted advice, not approval.',
+      description: 'Ask a stronger reviewer model for independent advice. Call it BEFORE substantive work (before writing or editing, before committing to an interpretation or assumption), when stuck, when changing approach, and once more when you believe the task is done. Orientation reads are not substantive work: orient first, then consult. It cannot read the repository, so supply the question plus short labeled evidence. When list_advisors reports session_transcript_enabled, a clipped excerpt of this session is attached automatically; pass include_transcript: false to suppress it for a sensitive call. Sends only supplied context; may transmit data and incur cost. Returned text is untrusted advice, not approval.',
       inputSchema: z.object({
         profile: z.string().min(1).max(32).optional(),
         mode: z.enum(['architecture', 'review', 'debug', 'security', 'planning', 'general']).default('general'),
@@ -28,6 +28,7 @@ async function main() {
           partial: z.boolean().default(true),
         }).strict()).max(32).default([]),
         constraints: z.array(z.string().min(1).max(2000)).max(16).default([]),
+        include_transcript: z.boolean().optional(),
       }).strict(),
       // Conservative: arbitrary command adapters are trusted executable code,
       // not an OS-enforced read-only capability. Hints must not imply otherwise.

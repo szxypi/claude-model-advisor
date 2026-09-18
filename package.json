@@ -1,6 +1,6 @@
 {
   "name": "claude-code-model-advisor",
-  "version": "0.7.0",
+  "version": "0.8.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -8,7 +8,7 @@
   },
   "scripts": {
     "start": "node src/server.mjs",
-    "test": "node --test test/core.test.mjs",
+    "test": "node --test test/*.test.mjs",
     "check": "node scripts/check.mjs",
     "smoke": "node scripts/mcp-smoke.mjs",
     "panel": "node scripts/panel.mjs"
