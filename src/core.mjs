@@ -1,5 +1,6 @@
 import { readFile, stat, mkdtemp, rm, mkdir, appendFile } from 'node:fs/promises';
 import { spawn } from 'node:child_process';
+import { connect } from 'node:net';
 import { randomUUID } from 'node:crypto';
 import { homedir, tmpdir } from 'node:os';
 import { isAbsolute, join, dirname, delimiter } from 'node:path';
@@ -14,6 +15,11 @@ export const DEFAULT_LIMITS = Object.freeze({
 const MAX_TOTAL_TIMEOUT_MS = 840000;
 // A fallback attempt with less time than this left before the overall deadline is skipped.
 const MIN_FALLBACK_MS = 30000;
+// After a NETWORK failure, the longest wait for the next hop's endpoint to accept TCP again.
+const NETWORK_WAIT_MS = 60000;
+// A TCP probe gives up after PROBE_TIMEOUT_MS. The next probe starts PROBE_RETRY_MS after a failure.
+const PROBE_TIMEOUT_MS = 1000;
+const PROBE_RETRY_MS = 1000;
 const MODES = ['architecture', 'review', 'debug', 'security', 'planning', 'general'];
 const MESSAGES = {
   CONFIG: 'Invalid configuration. Check the documented fields and value ranges.',
@@ -275,6 +281,63 @@ function checkedAnswer(answer, limits, knownSecrets) {
   return clean;
 }
 
+// Waits until the endpoint's host:port accepts a TCP connection, or until maxMs is used up.
+// Resolves { waitedMs, connected }. One probe runs at a time. A probe gives up after
+// PROBE_TIMEOUT_MS. A failed probe is retried after PROBE_RETRY_MS. An abort ends the wait at once.
+// Every exit clears the timer and destroys the socket. The promise never rejects: the caller
+// decides what an abort means.
+export function waitForEndpoint(endpoint, signal, maxMs) {
+  const started = Date.now();
+  return new Promise(resolve => {
+    let timer;
+    let socket;
+    let done = false;
+    const left = () => maxMs - (Date.now() - started);
+    const finish = connected => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      socket?.destroy();
+      signal?.removeEventListener('abort', onAbort);
+      resolve({ waitedMs: Date.now() - started, connected });
+    };
+    const onAbort = () => finish(false);
+    let target;
+    try {
+      const url = new URL(endpoint);
+      // URL keeps the brackets of an IPv6 literal ("[::1]"). net.connect needs the bare address.
+      target = { host: url.hostname.replace(/^\[(.*)\]$/, '$1'),
+        port: Number(url.port) || (url.protocol === 'https:' ? 443 : 80) };
+    } catch { finish(false); return; }
+    const probe = () => {
+      if (done) return;
+      const rest = left();
+      if (!(rest > 0)) { finish(false); return; }
+      let current;
+      try { current = connect(target); } catch { finish(false); return; }
+      socket = current;
+      let over = false;
+      const retry = () => {
+        if (over || done) return;
+        over = true;
+        clearTimeout(timer);
+        current.destroy();
+        socket = undefined;
+        const after = left();
+        if (!(after > 0)) finish(false);
+        else timer = setTimeout(probe, Math.min(PROBE_RETRY_MS, after));
+      };
+      current.once('connect', () => { if (!over) finish(true); });
+      // Stays attached after destroy(), so a late socket error can never go unhandled.
+      current.on('error', retry);
+      timer = setTimeout(retry, Math.min(PROBE_TIMEOUT_MS, rest));
+    };
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) finish(false);
+    else probe();
+  });
+}
+
 async function httpAdapter(profile, request, limits, signal, env) {
   const headers = { 'content-type': 'application/json', accept: 'application/json' };
   if (profile.apiKeyEnv) {
@@ -510,13 +573,32 @@ export function createAdvisor(config, { env = process.env } = {}) {
           // Chain end: nothing configured, an unknown or disabled profile, or a cycle back to
           // a profile that was already tried. The failing profile's record is already written.
           if (!nextProfile?.enabled || visited.includes(next)) throw lastError;
+          // A restarting gateway refuses connections for a while. Every later hop behind it then
+          // fails within milliseconds. So after a NETWORK failure, wait until the next hop's
+          // endpoint accepts TCP again. The wait leaves MIN_FALLBACK_MS of the deadline for the
+          // request. After the wait, the deadline check below runs as before, even if the endpoint
+          // is still down. A hop to a dead endpoint then fails fast as NETWORK. A closed engine
+          // skips the wait, so run() fails with SHUTDOWN as before.
+          let waited = {};
+          if (lastError instanceof AdvisorError && lastError.code === 'NETWORK' && nextProfile.endpoint && !closed) {
+            const maxMs = Math.min(NETWORK_WAIT_MS, deadline - Date.now() - MIN_FALLBACK_MS);
+            if (maxMs > 0) {
+              const wait = await waitBetweenHops(nextProfile.endpoint, signal, maxMs);
+              waited = { network_wait_ms: wait.waitedMs };
+              if (wait.error) {
+                await remember({ ok: false, profile: next, requested_model: nextProfile.model,
+                  fallback_from: name, fallback_reason: code, error_code: wait.error.code, ...waited });
+                throw wait.error;
+              }
+            }
+          }
           // The next hop only gets what is left of the overall deadline; too little left stops the
           // chain rather than start a paid request that cannot finish.
           const budget = Math.min(config.limits.timeoutMs, deadline - Date.now());
           const hopCode = lastError instanceof AdvisorError ? lastError.code : 'INTERNAL';
           if (budget < Math.min(MIN_FALLBACK_MS, config.limits.timeoutMs)) {
             await remember({ ok: false, profile: next, requested_model: nextProfile.model,
-              fallback_from: name, fallback_reason: code, error_code: hopCode, fallback_skipped: 'DEADLINE' });
+              fallback_from: name, fallback_reason: code, error_code: hopCode, fallback_skipped: 'DEADLINE', ...waited });
             throw lastError;
           }
           visited.push(next);
@@ -524,13 +606,13 @@ export function createAdvisor(config, { env = process.env } = {}) {
             const result = await run(next, nextProfile, input, signal, budget);
             await remember({ ok: true, request_id: result.request_id, profile: next, requested_model: nextProfile.model,
               fallback_from: name, fallback_reason: code, fallback_path: visited, answer_bytes: bytes(result.answer),
-              ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
+              ...waited, ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
             return { ...result, fallback_from: name, fallback_reason: code, fallback_path: visited };
           } catch (hopError) {
             lastError = hopError;
             await remember({ ok: false, profile: next, requested_model: nextProfile.model,
               fallback_from: name, fallback_reason: code,
-              error_code: hopError instanceof AdvisorError ? hopError.code : 'INTERNAL' });
+              error_code: hopError instanceof AdvisorError ? hopError.code : 'INTERNAL', ...waited });
             current = nextProfile;
           }
         }
@@ -563,6 +645,26 @@ export function createAdvisor(config, { env = process.env } = {}) {
       return undefined;
     }
     return { turns: read.turns, bytes: bytes(excerpt), dropped_older_turns: read.dropped_older_turns };
+  }
+  // Runs the NETWORK wait between two hops. The wait keeps the consultation's concurrency slot,
+  // as a running hop does. So a consultation that starts during the wait gets BUSY at once, and it
+  // cannot take the slot that the next hop needs. The caller's signal and close() both end the
+  // wait at once. In that case `error` holds the abort error (CANCELLED or SHUTDOWN) for the
+  // caller to record and throw. Otherwise `error` is undefined and the hop goes ahead.
+  async function waitBetweenHops(endpoint, signal, maxMs) {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(abortError(signal));
+    signal?.addEventListener('abort', onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    active.add(controller);
+    try {
+      const { waitedMs } = await waitForEndpoint(endpoint, controller.signal, maxMs);
+      return { waitedMs, error: controller.signal.aborted ? abortError(controller.signal) : undefined };
+    } finally {
+      // Released before run() checks maxConcurrency, so the next hop gets this slot back.
+      active.delete(controller);
+      signal?.removeEventListener('abort', onAbort);
+    }
   }
   async function run(name, profile, input, signal, timeoutMs) {
     if (closed) fail('SHUTDOWN');

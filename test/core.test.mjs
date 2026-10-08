@@ -6,7 +6,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { setTimeout as delay } from 'node:timers/promises';
-import { validateConfig, loadConfig, normalizeInput, createAdvisor, guardSecrets, publicError, defaultHistoryPath } from '../src/core.mjs';
+import { validateConfig, loadConfig, normalizeInput, createAdvisor, guardSecrets, publicError, defaultHistoryPath, waitForEndpoint } from '../src/core.mjs';
 const fixture = fileURLToPath(new URL('./fixtures/adapter.mjs', import.meta.url));
 const config = (mode = 'ok', limits = {}, extras = {}) => validateConfig({
   version: 1, defaultProfile: 'sol', limits,
@@ -350,6 +350,134 @@ test('fallback is not used for input, secret, budget or disabled-profile errors'
     await assert.rejects(createAdvisor(disabled).consult(input), isCode('NETWORK'));
     assert.equal(hits, 0);
   });
+});
+// A loopback port with nothing listening on it, so every connection to it is refused.
+async function closedPort() {
+  const server = createServer();
+  await new Promise((resolve, reject) => { server.once('error', reject); server.listen(0, '127.0.0.1', resolve); });
+  const { port } = server.address();
+  await new Promise(resolve => server.close(resolve));
+  return port;
+}
+const loopback = port => `http://127.0.0.1:${port}/v1/chat/completions`;
+const ledger = async path => (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+// Ref'ed timers and sockets only: any of these left behind keeps the test process alive.
+const liveHandles = () => process.getActiveResourcesInfo().filter(r => ['Timeout', 'TCPSocketWrap', 'ConnectWrap'].includes(r)).length;
+test('after a NETWORK failure the next hop waits for its endpoint to accept TCP, then succeeds', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-netwait-'));
+  const path = join(dir, 'history.jsonl');
+  // Both hops share one gateway endpoint, as in a CPA restart. It refuses connections for about 2 s.
+  const port = await closedPort();
+  let hits = 0;
+  const server = createServer((req, res) => { hits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); });
+  const reopen = setTimeout(() => server.listen(port, '127.0.0.1'), 2000);
+  try {
+    const r = await createAdvisor(fallbackConfig(loopback(port), loopback(port), {}, { history: { enabled: true, path } })).consult(input);
+    assert.equal(r.answer, 'kimi advice'); assert.equal(r.profile, 'kimi');
+    assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'NETWORK');
+    assert.deepEqual(r.fallback_path, ['sol', 'kimi']); assert.equal(hits, 1);
+    const lines = await ledger(path);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[0].profile, 'sol'); assert.equal(lines[0].error_code, 'NETWORK'); assert.equal(lines[0].network_wait_ms, undefined);
+    assert.equal(lines[1].ok, true); assert.equal(lines[1].profile, 'kimi'); assert.deepEqual(lines[1].fallback_path, ['sol', 'kimi']);
+    const waited = lines[1].network_wait_ms;
+    assert.ok(Number.isInteger(waited) && waited >= 1500 && waited < 10000, `network_wait_ms=${waited}`);
+  } finally {
+    clearTimeout(reopen);
+    await new Promise(resolve => { if (!server.listening) { resolve(); return; } server.close(resolve); server.closeAllConnections(); });
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+test('an endpoint that stays down is waited for only until the deadline minus the fallback reserve', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-netwait-deadline-'));
+  const down = loopback(await closedPort());
+  try {
+    // 32500 ms overall minus the 30000 ms fallback reserve leaves about 2.5 s for the wait, far below 60 s.
+    // timeoutMs 1000 keeps the per-hop floor below the reserve, so the hop is still sent after the wait.
+    const sent = join(dir, 'sent.jsonl');
+    const start = Date.now();
+    await assert.rejects(createAdvisor(fallbackConfig(down, down, {}, { limits: { timeoutMs: 1000, totalTimeoutMs: 32500 }, history: { enabled: true, path: sent } })).consult(input), isCode('NETWORK'));
+    const elapsed = Date.now() - start;
+    assert.ok(elapsed >= 2000 && elapsed < 5000, `elapsed=${elapsed}`);
+    let lines = await ledger(sent);
+    assert.equal(lines.length, 2);
+    assert.equal(lines[1].profile, 'kimi'); assert.equal(lines[1].error_code, 'NETWORK'); assert.equal(lines[1].fallback_skipped, undefined);
+    assert.ok(Number.isInteger(lines[1].network_wait_ms) && lines[1].network_wait_ms >= 2000 && lines[1].network_wait_ms < 3000, `network_wait_ms=${lines[1].network_wait_ms}`);
+    // With timeoutMs above the reserve, the wait leaves a budget of 30000 ms or a few ms less. The existing
+    // DEADLINE check then skips the hop, except on an exact-millisecond tie, where it sends the hop.
+    // Either way the hop record carries network_wait_ms and the chain ends with NETWORK.
+    const skipped = join(dir, 'skipped.jsonl');
+    await assert.rejects(createAdvisor(fallbackConfig(down, down, {}, { limits: { timeoutMs: 31000, totalTimeoutMs: 32500 }, history: { enabled: true, path: skipped } })).consult(input), isCode('NETWORK'));
+    lines = await ledger(skipped);
+    assert.equal(lines.length, 2); assert.equal(lines[1].profile, 'kimi'); assert.equal(lines[1].error_code, 'NETWORK');
+    assert.ok(lines[1].network_wait_ms >= 2000 && lines[1].network_wait_ms < 3000, `network_wait_ms=${lines[1].network_wait_ms}`);
+    assert.ok([undefined, 'DEADLINE'].includes(lines[1].fallback_skipped));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('cancellation or shutdown during the NETWORK wait ends it at once and leaves no timer or socket behind', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-netwait-abort-'));
+  const path = join(dir, 'history.jsonl');
+  const down = loopback(await closedPort());
+  try {
+    const before = liveHandles();
+    const e = createAdvisor(fallbackConfig(down, down, {}, { history: { enabled: true, path } }));
+    const ac = new AbortController();
+    const pending = e.consult(input, { signal: ac.signal });
+    const checked = assert.rejects(pending, isCode('CANCELLED'));
+    await delay(300);
+    // The wait keeps the consultation's concurrency slot, as a running hop does.
+    await assert.rejects(e.consult(input), isCode('BUSY'));
+    let at = Date.now();
+    ac.abort();
+    await checked;
+    assert.ok(Date.now() - at < 1000);
+    const hop = (await ledger(path)).find(l => l.profile === 'kimi');
+    assert.equal(hop.error_code, 'CANCELLED'); assert.equal(hop.fallback_reason, 'NETWORK');
+    assert.ok(Number.isInteger(hop.network_wait_ms) && hop.network_wait_ms >= 200 && hop.network_wait_ms < 1500, `network_wait_ms=${hop.network_wait_ms}`);
+    // close() reaches a wait in progress the same way it reaches a running adapter.
+    const s = createAdvisor(fallbackConfig(down, down));
+    const stopped = assert.rejects(s.consult(input), isCode('SHUTDOWN'));
+    await delay(300);
+    at = Date.now();
+    s.close();
+    await stopped;
+    assert.ok(Date.now() - at < 1000);
+    // An abort while a probe socket is still connecting also cleans up.
+    const probe = new AbortController();
+    const waiting = waitForEndpoint(down, probe.signal, 60000);
+    probe.abort();
+    const result = await waiting;
+    assert.equal(result.connected, false); assert.ok(result.waitedMs < 100);
+    await delay(50);
+    assert.ok(liveHandles() <= before, JSON.stringify(process.getActiveResourcesInfo()));
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('no wait unless the failure is NETWORK and the next hop has an endpoint, as in 0.9.0', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-netwait-none-'));
+  const down = loopback(await closedPort());
+  try {
+    // HTTP_OVERLOADED, then an unreachable next hop: a wait would hold the chain for 60 s.
+    const overloaded = join(dir, 'overloaded.jsonl');
+    await httpFixture((req, res) => { res.statusCode = 500; res.end('{}'); }, async primary => {
+      const start = Date.now();
+      await assert.rejects(createAdvisor(fallbackConfig(primary, down, {}, { history: { enabled: true, path: overloaded } })).consult(input), isCode('NETWORK'));
+      assert.ok(Date.now() - start < 1000);
+    });
+    let lines = await ledger(overloaded);
+    assert.equal(lines.length, 2); assert.equal(lines[0].error_code, 'HTTP_OVERLOADED');
+    assert.equal(lines[1].profile, 'kimi'); assert.equal(lines[1].fallback_reason, 'HTTP_OVERLOADED'); assert.equal(lines[1].error_code, 'NETWORK');
+    assert.ok(!('network_wait_ms' in lines[1]));
+    // NETWORK, then a command profile: it has no endpoint, so it runs at once.
+    const command = join(dir, 'command.jsonl');
+    const cfg = validateConfig({ version: 1, defaultProfile: 'sol', history: { enabled: true, path: command }, profiles: {
+      sol: { kind: 'chat-completions', model: 'sol-id', enabled: true, endpoint: down, allowInsecureLoopback: true, fallbackProfile: 'local' },
+      local: { kind: 'command', model: 'local-id', enabled: true, command: process.execPath, args: [fixture, 'ok'] },
+    } });
+    const r = await createAdvisor(cfg).consult(input);
+    assert.equal(r.profile, 'local'); assert.equal(r.fallback_reason, 'NETWORK'); assert.deepEqual(r.fallback_path, ['sol', 'local']);
+    lines = await ledger(command);
+    assert.equal(lines.length, 2); assert.equal(lines[1].ok, true); assert.ok(!('network_wait_ms' in lines[1]));
+  } finally { await rm(dir, { recursive: true, force: true }); }
 });
 test('history is off by default, validated, and platform-aware', () => {
   assert.equal(config().history.enabled, false);

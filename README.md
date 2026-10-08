@@ -74,6 +74,7 @@ claude plugin install model-advisor@model-advisor --scope user
 - 需要控制回答长度时加 `"answerWordBudget": 400`（40–2000）：请求里会以第二人称直接给顾问加一行软约束（“keep your guidance under N words”），并在 payload 里带 `answer_word_budget` 供命令 Adapter 使用。软约束会被偶尔突破，按你真正能接受长度的约 80% 来配；中文回答里“words”只是个粗略长度信号，实测会被理解但不精确。
 - 需要自动回退时给 profile 加 `"fallbackProfile": "kimi"`：仅当该 profile 出现供应商/传输类错误（限流、5xx、网络、超时、响应无效，以及网关上 provider 被禁用时返回的 400 `unknown provider for model`）时沿 `fallbackProfile` 链依次回退，直到成功或链穷尽；已尝试过的 profile 不会重复尝试（防环）。结果里 `fallback_from`/`fallback_reason` 记录最初失败的 profile 和最初错误码，另带 `fallback_path` 记录实际经过的链（如 `["opus-xhigh","opus","astra"]`）；输入错误、敏感信息拦截、取消、次数用尽不会触发回退，其他 4xx 也不会。
 - 超时：`limits.timeoutMs` 是单个 profile 一次请求的截止时间（默认 120000，允许 1000–600000 ms），推理强度高的模型要调大；`limits.totalTimeoutMs` 是含回退在内整次咨询的截止时间（默认 840000，允许 `timeoutMs`–840000 ms），每一跳只用剩余时间，剩余不足 30 秒（或不足 `timeoutMs`，取小者）时停止回退链、返回最后一次错误，台账记 `fallback_skipped: "DEADLINE"`。宿主工具超时 `.mcp.json` 为 900000 ms，始终比插件自身截止时间多留 60 秒；Claude Code 在调用满 120 秒后会把它转入后台继续等。
+- 网络中断等待：如果某一跳报 `NETWORK`（例如网关重启），插件先等下一跳 endpoint 的 TCP 端口恢复连接，再发请求。插件约每秒探测一次端口。等待最多 60 秒，并且不占用整次截止时间的最后 30 秒。`command` profile 没有 endpoint，所以不等待。等待结束后，插件按上一条的截止时间规则处理这一跳，端口仍连不上时也一样。台账在该跳的记录里写 `network_wait_ms`。
 - 需要传供应商特有参数（推理强度、temperature 等）时加 `"extraBody": { "reasoning_effort": "xhigh" }`，内容原样并入请求体；不能覆盖 `model`/`messages`/`stream`/工具类字段，字段名和取值是否被支持由供应商决定。
 - 更多示例：`examples/config.http.json`（多 profile）、`examples/config.command.json`（命令 Adapter）。
 
