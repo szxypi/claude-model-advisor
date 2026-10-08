@@ -227,14 +227,15 @@ test('fallbackProfile must reference another existing profile', () => {
   const ok = validateConfig({ version: 1, defaultProfile: 'a', profiles: { a: { ...base, fallbackProfile: 'b' }, b: base } });
   assert.equal(createAdvisor(ok).list().profiles[0].fallback_profile, 'b');
 });
-test('provider failure falls back exactly one hop and is reported', async () => {
+test('provider failure walks the fallback chain and is reported', async () => {
   let secondaryHits = 0;
   await httpFixture((req, res) => { res.statusCode = 500; res.end('{}'); }, async primary => {
     await httpFixture((req, res) => { secondaryHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); }, async secondary => {
       const r = await createAdvisor(fallbackConfig(primary, secondary)).consult(input);
       assert.equal(r.answer, 'kimi advice'); assert.equal(r.profile, 'kimi'); assert.equal(r.requested_model, 'kimi-id');
-      assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_OVERLOADED'); assert.equal(secondaryHits, 1);
-      // Both profiles failing: the secondary's own fallback (sol) is not chained.
+      assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_OVERLOADED');
+      assert.deepEqual(r.fallback_path, ['sol', 'kimi']); assert.equal(secondaryHits, 1);
+      // Both profiles failing: kimi's fallback points back to sol, which is already visited, so the cycle stops.
       const dead = createAdvisor(fallbackConfig(primary, primary));
       await assert.rejects(dead.consult(input), isCode('HTTP_OVERLOADED'));
       assert.equal(dead.list().calls_remaining, 28);
@@ -263,14 +264,80 @@ test('fallback is skipped when the overall deadline leaves too little time, and 
         const e = createAdvisor(fallbackConfig(primary, secondary, {}, { limits: { timeoutMs: 1000, totalTimeoutMs: 1500 }, history: { enabled: true, path } }));
         await assert.rejects(e.consult(input), isCode('TIMEOUT'));
         assert.equal(secondaryHits, 0); assert.ok(Date.now() - start < 2500);
-        const [line] = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
-        assert.equal(line.profile, 'sol'); assert.equal(line.error_code, 'TIMEOUT'); assert.equal(line.fallback_skipped, 'DEADLINE');
+        const lines = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+        assert.equal(lines.length, 2);
+        assert.equal(lines[0].profile, 'sol'); assert.equal(lines[0].error_code, 'TIMEOUT'); assert.equal(lines[0].fallback_from, undefined);
+        assert.equal(lines[1].profile, 'kimi'); assert.equal(lines[1].error_code, 'TIMEOUT');
+        assert.equal(lines[1].fallback_from, 'sol'); assert.equal(lines[1].fallback_skipped, 'DEADLINE');
       });
     });
   } finally { await rm(dir, { recursive: true, force: true }); }
 });
-test('fallback is not used for input, secret, budget or disabled-profile errors', async () => {
-  let hits = 0;
+test('a three-hop chain survives 500 then 400-unknown-provider and reports the original reason', async () => {
+  const dir = await mkdtemp(join(tmpdir(), 'advisor-chain-'));
+  const path = join(dir, 'history.jsonl');
+  let solHits = 0, astraHits = 0, kimiHits = 0;
+  try {
+    await httpFixture((req, res) => { solHits++; res.statusCode = 500; res.end('{}'); }, async sol => {
+      // A disabled provider on the gateway (CPA) answers 400 "unknown provider for model".
+      await httpFixture((req, res) => { astraHits++; res.writeHead(400); res.end(JSON.stringify({ error: { message: 'unknown provider for model gpt-6-astra' } })); }, async astra => {
+        await httpFixture((req, res) => { kimiHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('kimi advice'))); }, async kimi => {
+          const cfg = validateConfig({ version: 1, defaultProfile: 'sol', history: { enabled: true, path }, profiles: {
+            sol: { kind: 'chat-completions', model: 'sol-id', enabled: true, endpoint: sol, allowInsecureLoopback: true, fallbackProfile: 'astra' },
+            astra: { kind: 'chat-completions', model: 'astra-id', enabled: true, endpoint: astra, allowInsecureLoopback: true, fallbackProfile: 'kimi' },
+            kimi: { kind: 'chat-completions', model: 'kimi-id', enabled: true, endpoint: kimi, allowInsecureLoopback: true },
+          } });
+          const r = await createAdvisor(cfg).consult(input);
+          assert.equal(r.answer, 'kimi advice'); assert.equal(r.profile, 'kimi');
+          // The result keeps the ORIGINAL failure attribution even though the middle hop failed differently.
+          assert.equal(r.fallback_from, 'sol'); assert.equal(r.fallback_reason, 'HTTP_OVERLOADED');
+          assert.deepEqual(r.fallback_path, ['sol', 'astra', 'kimi']);
+          assert.equal(solHits, 1); assert.equal(astraHits, 1); assert.equal(kimiHits, 1);
+          const lines = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
+          assert.equal(lines.length, 3);
+          assert.equal(lines[0].ok, false); assert.equal(lines[0].profile, 'sol'); assert.equal(lines[0].error_code, 'HTTP_OVERLOADED');
+          assert.equal(lines[0].fallback_from, undefined);
+          assert.equal(lines[1].ok, false); assert.equal(lines[1].profile, 'astra'); assert.equal(lines[1].error_code, 'HTTP_PROVIDER');
+          assert.equal(lines[1].fallback_from, 'sol'); assert.equal(lines[1].fallback_reason, 'HTTP_OVERLOADED');
+          assert.equal(lines[2].ok, true); assert.equal(lines[2].profile, 'kimi');
+          assert.equal(lines[2].fallback_from, 'sol'); assert.equal(lines[2].fallback_reason, 'HTTP_OVERLOADED');
+          assert.deepEqual(lines[2].fallback_path, ['sol', 'astra', 'kimi']);
+        });
+      });
+    });
+  } finally { await rm(dir, { recursive: true, force: true }); }
+});
+test('fallback chains stop at an already visited profile instead of looping', async () => {
+  let aHits = 0, bHits = 0;
+  await httpFixture((req, res) => { aHits++; res.statusCode = 500; res.end('{}'); }, async a => {
+    await httpFixture((req, res) => { bHits++; res.statusCode = 500; res.end('{}'); }, async b => {
+      const cfg = validateConfig({ version: 1, defaultProfile: 'a', profiles: {
+        a: { kind: 'chat-completions', model: 'a-id', enabled: true, endpoint: a, allowInsecureLoopback: true, fallbackProfile: 'b' },
+        b: { kind: 'chat-completions', model: 'b-id', enabled: true, endpoint: b, allowInsecureLoopback: true, fallbackProfile: 'a' },
+      } });
+      await assert.rejects(createAdvisor(cfg).consult(input), isCode('HTTP_OVERLOADED'));
+      assert.equal(aHits, 1); assert.equal(bHits, 1);
+    });
+  });
+});
+test('a mid-chain hop that eats the deadline stops the chain before the next hop', async () => {
+  let kimiHits = 0;
+  await httpFixture((req, res) => { res.statusCode = 500; res.end('{}'); }, async sol => {
+    await httpFixture(() => {}, async astra => {
+      await httpFixture((req, res) => { kimiHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion())); }, async kimi => {
+        const cfg = validateConfig({ version: 1, defaultProfile: 'sol', limits: { timeoutMs: 1000, totalTimeoutMs: 1800 }, profiles: {
+          sol: { kind: 'chat-completions', model: 's', enabled: true, endpoint: sol, allowInsecureLoopback: true, fallbackProfile: 'astra' },
+          astra: { kind: 'chat-completions', model: 'as', enabled: true, endpoint: astra, allowInsecureLoopback: true, fallbackProfile: 'kimi' },
+          kimi: { kind: 'chat-completions', model: 'k', enabled: true, endpoint: kimi, allowInsecureLoopback: true },
+        } });
+        const start = Date.now();
+        await assert.rejects(createAdvisor(cfg).consult(input), isCode('TIMEOUT'));
+        assert.equal(kimiHits, 0); assert.ok(Date.now() - start < 2500);
+      });
+    });
+  });
+});
+test('fallback is not used for input, secret, budget or disabled-profile errors', async () => {  let hits = 0;
   await httpFixture((req, res) => { hits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion())); }, async secondary => {
     const e = createAdvisor(fallbackConfig('https://primary.invalid/v1/chat/completions', secondary));
     await assert.rejects(e.consult({ question: 'token sk-abcdefghijklmnopqrstuvwxyz0123' }), isCode('SENSITIVE_INPUT'));
@@ -305,16 +372,18 @@ test('history ledger records success, failure and fallback without leaking secre
         kimi: { kind: 'chat-completions', model: 'kimi-id', enabled: true, endpoint, allowInsecureLoopback: true },
       } });
       const env = { HK: 'ledger-secret-key-123' };
-      // primary 500 -> fallback also 500 -> failure record with fallback fields
+      // primary 500 -> fallback also 500 -> one failure record per attempted profile
       await assert.rejects(createAdvisor(make({ path }), { env }).consult(input), isCode('HTTP_OVERLOADED'));
       fail500 = false;
       const r = await createAdvisor(make({ path, storeAnswer: false }), { env }).consult({ question: 'Q2', context: [{ label: 'L1', text: 'evidence' }] });
       assert.equal(r.answer, 'ledger advice');
       const lines = (await readFile(path, 'utf8')).trim().split('\n').map(l => JSON.parse(l));
-      assert.equal(lines.length, 2);
-      assert.equal(lines[0].ok, false); assert.equal(lines[0].fallback_from, 'sol'); assert.equal(lines[0].profile, 'kimi'); assert.equal(lines[0].error_code, 'HTTP_OVERLOADED');
-      assert.equal(lines[1].ok, true); assert.equal(lines[1].question, 'Q2'); assert.deepEqual(lines[1].context_labels, ['L1']);
-      assert.equal(lines[1].answer, undefined); assert.equal(lines[1].answer_bytes, 13);
+      assert.equal(lines.length, 3);
+      assert.equal(lines[0].ok, false); assert.equal(lines[0].profile, 'sol'); assert.equal(lines[0].error_code, 'HTTP_OVERLOADED');
+      assert.equal(lines[0].fallback_from, undefined);
+      assert.equal(lines[1].ok, false); assert.equal(lines[1].fallback_from, 'sol'); assert.equal(lines[1].profile, 'kimi'); assert.equal(lines[1].error_code, 'HTTP_OVERLOADED');
+      assert.equal(lines[2].ok, true); assert.equal(lines[2].question, 'Q2'); assert.deepEqual(lines[2].context_labels, ['L1']);
+      assert.equal(lines[2].answer, undefined); assert.equal(lines[2].answer_bytes, 13);
       assert.ok(!(await readFile(path, 'utf8')).includes('ledger-secret-key-123'));
       // unwritable history path (parent is a regular file) does not break the consultation
       await writeFile(join(dir, 'blocker'), 'x');
@@ -332,6 +401,35 @@ for (const [status, code] of [[401, 'HTTP_AUTH'], [403, 'HTTP_AUTH'], [429, 'HTT
     });
   });
 }
+test('HTTP 400 with unknown provider for model is a provider failure that triggers fallback', async () => {
+  let backupHits = 0;
+  await httpFixture((req, res) => { res.writeHead(400); res.end(JSON.stringify({ error: { message: 'unknown provider for model gpt-6-astra' } })); }, async primary => {
+    // Without a fallback configured the new code is surfaced.
+    await assert.rejects(createAdvisor(httpConfig(primary)).consult(input), isCode('HTTP_PROVIDER'));
+    await httpFixture((req, res) => { backupHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion('backup advice'))); }, async secondary => {
+      const cfg = validateConfig({ version: 1, defaultProfile: 'a', profiles: {
+        a: { kind: 'chat-completions', model: 'a-id', enabled: true, endpoint: primary, allowInsecureLoopback: true, fallbackProfile: 'b' },
+        b: { kind: 'chat-completions', model: 'b-id', enabled: true, endpoint: secondary, allowInsecureLoopback: true },
+      } });
+      const r = await createAdvisor(cfg).consult(input);
+      assert.equal(r.answer, 'backup advice'); assert.equal(r.fallback_reason, 'HTTP_PROVIDER');
+      assert.deepEqual(r.fallback_path, ['a', 'b']); assert.equal(backupHits, 1);
+    });
+  });
+});
+test('other HTTP 400 bodies stay HTTP_ERROR and never trigger a fallback', async () => {
+  let backupHits = 0;
+  await httpFixture((req, res) => { res.writeHead(400); res.end('{"error":"invalid request"}'); }, async primary => {
+    await httpFixture((req, res) => { backupHits++; res.setHeader('Content-Type', 'application/json'); res.end(JSON.stringify(completion())); }, async secondary => {
+      const cfg = validateConfig({ version: 1, defaultProfile: 'a', profiles: {
+        a: { kind: 'chat-completions', model: 'a-id', enabled: true, endpoint: primary, allowInsecureLoopback: true, fallbackProfile: 'b' },
+        b: { kind: 'chat-completions', model: 'b-id', enabled: true, endpoint: secondary, allowInsecureLoopback: true },
+      } });
+      await assert.rejects(createAdvisor(cfg).consult(input), isCode('HTTP_ERROR'));
+      assert.equal(backupHits, 0);
+    });
+  });
+});
 test('HTTP redirects are not followed', async () => {
   let hits = 0;
   await httpFixture((req, res) => { hits++; res.writeHead(302, { Location: '/another-endpoint' }); res.end(); }, async endpoint => {

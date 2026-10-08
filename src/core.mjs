@@ -41,13 +41,17 @@ const MESSAGES = {
   HTTP_AUTH: 'Provider rejected authentication or authorization.',
   HTTP_RATE: 'Provider rate limit reached. No automatic retry was performed.',
   HTTP_OVERLOADED: 'Provider is overloaded or failing (5xx); response body was withheld.',
+  // A gateway whose provider is disabled (e.g. CPA) answers 400 "unknown provider for model":
+  // the model is dead on the provider side, so this is a provider failure, not an input error.
+  HTTP_PROVIDER: 'Provider no longer serves this model (400 unknown provider for model); response body was withheld.',
   HTTP_ERROR: 'Provider returned an unsuccessful HTTP status; response body was withheld.',
   NETWORK: 'Provider network request failed. Check the endpoint, TLS, and connectivity.',
   INTERNAL: 'Unexpected advisor error; sensitive diagnostic details were withheld.',
 };
-// Provider-side or transport failures where a configured fallback profile may be tried once.
-// Input, secret, budget, cancellation and configuration errors never trigger a fallback.
-const FALLBACK_CODES = new Set(['HTTP_RATE', 'HTTP_OVERLOADED', 'HTTP_ERROR', 'HTTP_AUTH', 'NETWORK', 'TIMEOUT', 'BAD_RESPONSE',
+// Provider-side or transport failures where the configured fallback chain may be followed.
+// Input, secret, budget, cancellation and configuration errors never trigger a fallback,
+// and neither does HTTP_ERROR: other 4xx statuses mean the request itself was rejected.
+const FALLBACK_CODES = new Set(['HTTP_RATE', 'HTTP_OVERLOADED', 'HTTP_PROVIDER', 'HTTP_AUTH', 'NETWORK', 'TIMEOUT', 'BAD_RESPONSE',
   'INCOMPLETE', 'OUTPUT_LIMIT', 'ADAPTER_START', 'ADAPTER_IO', 'ADAPTER_EXIT', 'SENSITIVE_OUTPUT']);
 export class AdvisorError extends Error {
   constructor(code) { super(MESSAGES[code] ?? MESSAGES.INTERNAL); this.code = code; }
@@ -136,7 +140,8 @@ export function validateConfig(raw) {
     profiles.set(name, Object.freeze({ ...p, enabled: p.enabled === true }));
   }
   if (profiles.size < 1 || profiles.size > 16 || !profiles.has(raw.defaultProfile)) fail('CONFIG');
-  // A fallback must name another configured profile. Only one hop is ever taken; chains are not followed.
+  // A fallback must name another configured profile. Chains are followed at runtime;
+  // the visited set there is the cycle defense, since config validation only bans self-reference.
   for (const p of profiles.values()) if (p.fallbackProfile !== undefined && !profiles.has(p.fallbackProfile)) fail('CONFIG');
   const history = validateHistory(raw.history);
   const transcript = validateTranscript(raw.transcript);
@@ -292,8 +297,28 @@ async function httpAdapter(profile, request, limits, signal, env) {
     response = await fetch(profile.endpoint, { method: 'POST', headers, body, signal, redirect: 'error' });
   } catch { if (signal.aborted) throw abortError(signal); fail('NETWORK'); }
   if (!response.ok) {
-    await response.body?.cancel().catch(() => {});
-    fail([401, 403].includes(response.status) ? 'HTTP_AUTH'
+    // A 400 is classified by its body: CPA answers "unknown provider for model" when the
+    // provider behind a configured model is disabled, which is a provider-side death and
+    // must trigger fallback like a 5xx. Other statuses stay unread.
+    let snippet = '';
+    if (response.status === 400 && response.body) {
+      try {
+        const reader = response.body.getReader();
+        const chunks = [];
+        let size = 0;
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          size += value.byteLength;
+          if (size > 8192) { await reader.cancel().catch(() => {}); break; }
+          chunks.push(Buffer.from(value));
+        }
+        snippet = Buffer.concat(chunks).toString('utf8');
+      } catch { /* Unreadable body: classification falls through to the status rules below. */ }
+    } else await response.body?.cancel().catch(() => {});
+    checkAbort(signal);
+    fail(response.status === 400 && /unknown provider for model/i.test(snippet) ? 'HTTP_PROVIDER'
+      : [401, 403].includes(response.status) ? 'HTTP_AUTH'
       : response.status === 429 ? 'HTTP_RATE'
       : response.status >= 500 ? 'HTTP_OVERLOADED' : 'HTTP_ERROR');
   }
@@ -462,31 +487,52 @@ export function createAdvisor(config, { env = process.env } = {}) {
           ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
         return result;
       } catch (error) {
-        const fb = profile.fallbackProfile;
-        const fbProfile = fb !== undefined ? config.profiles.get(fb) : undefined;
         const code = error instanceof AdvisorError ? error.code : 'INTERNAL';
-        if (!(error instanceof AdvisorError) || !FALLBACK_CODES.has(error.code) || !fbProfile?.enabled || signal?.aborted) {
+        const retryable = e => e instanceof AdvisorError && FALLBACK_CODES.has(e.code) && !signal?.aborted;
+        // Non-retryable failures and aborts never start a chain.
+        if (!retryable(error)) {
           await remember({ ok: false, error_code: code });
           throw error;
         }
-        // The fallback only gets what is left of the overall deadline; too little left means skip it
-        // rather than start a paid request that cannot finish.
-        const budget = Math.min(config.limits.timeoutMs, deadline - Date.now());
-        if (budget < Math.min(MIN_FALLBACK_MS, config.limits.timeoutMs)) {
-          await remember({ ok: false, error_code: code, fallback_skipped: 'DEADLINE' });
-          throw error;
-        }
-        // Exactly one hop: the fallback's own fallbackProfile is not consulted.
-        try {
-          const result = await run(fb, fbProfile, input, signal, budget);
-          await remember({ ok: true, request_id: result.request_id, profile: fb, requested_model: fbProfile.model,
-            fallback_from: name, fallback_reason: code, answer_bytes: bytes(result.answer),
-            ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
-          return { ...result, fallback_from: name, fallback_reason: code };
-        } catch (second) {
-          await remember({ ok: false, profile: fb, requested_model: fbProfile.model, fallback_from: name, fallback_reason: code,
-            error_code: second instanceof AdvisorError ? second.code : 'INTERNAL' });
-          throw second;
+        // Follow the fallbackProfile chain until a profile answers or the chain ends. The ledger
+        // gets one record per attempted profile: the initial failure carries no fallback fields,
+        // every hop record carries the ORIGINAL fallback_from/fallback_reason, and the successful
+        // record adds the path actually taken. The visited set is the runtime cycle defense.
+        const visited = [name];
+        let current = profile;
+        let lastError = error;
+        await remember({ ok: false, error_code: code });
+        for (;;) {
+          // Only provider-side errors continue the chain; aborts and input-class errors stop it.
+          if (!retryable(lastError)) throw lastError;
+          const next = current.fallbackProfile;
+          const nextProfile = next !== undefined ? config.profiles.get(next) : undefined;
+          // Chain end: nothing configured, an unknown or disabled profile, or a cycle back to
+          // a profile that was already tried. The failing profile's record is already written.
+          if (!nextProfile?.enabled || visited.includes(next)) throw lastError;
+          // The next hop only gets what is left of the overall deadline; too little left stops the
+          // chain rather than start a paid request that cannot finish.
+          const budget = Math.min(config.limits.timeoutMs, deadline - Date.now());
+          const hopCode = lastError instanceof AdvisorError ? lastError.code : 'INTERNAL';
+          if (budget < Math.min(MIN_FALLBACK_MS, config.limits.timeoutMs)) {
+            await remember({ ok: false, profile: next, requested_model: nextProfile.model,
+              fallback_from: name, fallback_reason: code, error_code: hopCode, fallback_skipped: 'DEADLINE' });
+            throw lastError;
+          }
+          visited.push(next);
+          try {
+            const result = await run(next, nextProfile, input, signal, budget);
+            await remember({ ok: true, request_id: result.request_id, profile: next, requested_model: nextProfile.model,
+              fallback_from: name, fallback_reason: code, fallback_path: visited, answer_bytes: bytes(result.answer),
+              ...(config.history.storeAnswer ? { answer: result.answer } : {}) });
+            return { ...result, fallback_from: name, fallback_reason: code, fallback_path: visited };
+          } catch (hopError) {
+            lastError = hopError;
+            await remember({ ok: false, profile: next, requested_model: nextProfile.model,
+              fallback_from: name, fallback_reason: code,
+              error_code: hopError instanceof AdvisorError ? hopError.code : 'INTERNAL' });
+            current = nextProfile;
+          }
         }
       }
     },
